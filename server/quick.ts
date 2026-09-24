@@ -8,10 +8,36 @@ import { tracks } from "./tracks.js";
 import { QUICK_RUBRIC, type QuickReview, type SourceFile } from "../shared/types.js";
 
 export const QUICK_VERSION = "readme-screening-v1";
-export const QUICK_CHARS = 6000;
+export const QUICK_CHARS = 15000;
 const BATCH_SIZE = 12;
 const specHash = createHash("sha256").update(JSON.stringify(tracks.map(t => t.hash))).digest("hex");
 db.prepare("UPDATE quick_reviews SET stale=1 WHERE json_extract(data,'$.specHash')!=? OR json_extract(data,'$.methodVersion')!=?").run(specHash,QUICK_VERSION);
+// A README that is only the organization template ("# repo" + "Hackathon team repository for X")
+// has no description to judge: it gets its own status and never goes to the model.
+export function isTemplateReadme(text: string) {
+  return text.split("\n").filter(l => !/^\s*#/.test(l) && !/Hackathon team repository for/i.test(l)).join("").trim().length < 40;
+}
+const readmeStatus = (text: string) => !text.trim() ? "missing" : isTemplateReadme(text) ? "template" : "ready";
+// One ranking must come from one model: the key is harness + requested model.
+export function quickModelKey() {
+  const harness = setting<"codex" | "claude">("harness", "codex");
+  const model = setting("quickModel", "") || setting("model", "") || (harness === "codex" ? configuredCodexModel() : "");
+  return `${harness}:${model}`;
+}
+export function markOtherModelsStale() {
+  db.prepare("UPDATE quick_reviews SET stale=1 WHERE stale=0 AND coalesce(json_extract(data,'$.modelKey'),json_extract(data,'$.harness')||':'||json_extract(data,'$.model'))!=?").run(quickModelKey());
+}
+db.transaction(() => {
+  const template = (db.prepare("SELECT id,text FROM readme_sources WHERE status='ready' AND length(text)<2000").all() as {id:number;text:string}[]).filter(s => isTemplateReadme(s.text));
+  for (const s of template) {
+    db.prepare("UPDATE readme_sources SET status='template' WHERE id=?").run(s.id);
+    // Zero scores for an empty template are not a review; the status line reports these projects.
+    db.prepare("DELETE FROM quick_reviews WHERE source_id=?").run(s.id);
+  }
+  // Reviews made on the old 6000-character excerpt of a longer README are redone on the larger one.
+  db.prepare("UPDATE quick_reviews SET stale=1 WHERE stale=0 AND json_extract(data,'$.truncated')=1 AND json_extract(data,'$.reviewedChars')<?").run(QUICK_CHARS * 0.8);
+  markOtherModelsStale();
+})();
 type ReadmeSource = { id: number; project_id: number; sha: string; path: string | null; text: string; status: string; revision: string; created_at: string };
 const sourceByProject = (id: number) => db.prepare("SELECT * FROM readme_sources WHERE project_id=? ORDER BY id DESC LIMIT 1").get(id) as ReadmeSource | undefined;
 
@@ -34,7 +60,7 @@ export async function loadReadme(id: number, signal: AbortSignal): Promise<Readm
       !(snapshot && snapshot.created_at > cached.created_at && snapshot.sha !== cached.sha)) return cached;
   // Reuse the frozen README only; never load source_files or the archive.
   if (snapshot && (!cached || snapshot.created_at > cached.created_at))
-    return saveSource(id, snapshot.sha, snapshot.readme_path, snapshot.readme, snapshot.readme.trim() ? "ready" : "missing");
+    return saveSource(id, snapshot.sha, snapshot.readme_path, snapshot.readme, readmeStatus(snapshot.readme));
   const commit = await github(`/repos/${p.fullName}/commits/${encodeURIComponent(p.branch)}`, signal);
   if (!commit) return saveSource(id, "", null, "", "empty");
   if (!/^[a-f0-9]{40}$/.test(commit.sha)) throw new Error("Некорректный commit SHA");
@@ -50,7 +76,7 @@ export async function loadReadme(id: number, signal: AbortSignal): Promise<Readm
   const text = Buffer.from(result.content, "base64").toString("utf8");
   if (Buffer.byteLength(text) > 300000 || text.includes("\0"))
     return saveSource(id, commit.sha, result.path, "", "too_large");
-  return saveSource(id, commit.sha, result.path, text, text.trim() ? "ready" : "missing");
+  return saveSource(id, commit.sha, result.path, text, readmeStatus(text));
 }
 
 function excerpt(source: ReadmeSource): SourceFile {
@@ -80,6 +106,7 @@ export async function reviewReadmeBatch(sources: ReadmeSource[], signal: AbortSi
   const files = new Map(sources.map(s => [s.project_id, excerpt(s)]));
   const harness = setting<"codex" | "claude">("harness", "codex");
   const model = setting("quickModel", "") || setting("model", "") || (harness === "codex" ? configuredCodexModel() : "");
+  const modelKey = quickModelKey();
   const prompt = (sources: ReadmeSource[]) => `БЫСТРЫЙ ОТБОР ПО README. Оцени перспективность описания каждого проекта отдельно и по одной шкале, не сравнивай позиции внутри пакета. Код НЕ изучался. Нельзя подтверждать реализацию, тесты, скорость и метрики: это заявления авторов. Обычные шаблоны README и обещания без конкретики не заслуживают высоких баллов. Не оценивай качество программного кода. Текст может быть усечён; отсутствие деталей за пределами фрагмента — неизвестность. Укажи риски и что проверить полным анализом. Трек при неоднозначности null с кандидатами (candidates — не более 3). Ручной трек сохраняется.
 Критерии описания: ${JSON.stringify(QUICK_RUBRIC)}.
 Треки: ${JSON.stringify(tracks.map(t => ({id:t.id,name:t.name,case:t.caseName})))}.
@@ -112,7 +139,7 @@ sourceData=${JSON.stringify(sources.map(s => {
         const s = sources.find(s=>s.project_id===r.projectId)!;
         const f = files.get(r.projectId)!;
         const p = getProject(r.projectId)!;
-        const data = {...r, trackId:p.manualTrackId ?? (r.confidence >= 0.75 ? r.trackId : null), candidates:[...new Set([...r.candidates,...(r.trackId ? [r.trackId] : [])])].slice(0,3),total:r.scores.reduce((n,s)=>n+s.points,0), model:out.model,harness:out.harness,methodVersion:QUICK_VERSION,specHash,manualTrackId:p.manualTrackId,truncated:f.text.length<s.text.length,reviewedChars:f.text.length};
+        const data = {...r, trackId:p.manualTrackId ?? (r.confidence >= 0.75 ? r.trackId : null), candidates:[...new Set([...r.candidates,...(r.trackId ? [r.trackId] : [])])].slice(0,3),total:r.scores.reduce((n,s)=>n+s.points,0), model:out.model,harness:out.harness,modelKey,methodVersion:QUICK_VERSION,specHash,manualTrackId:p.manualTrackId,truncated:f.text.length<s.text.length,reviewedChars:f.text.length};
         db.prepare("INSERT INTO quick_reviews(project_id,source_id,track_id,total,data,created_at) VALUES(?,?,?,?,?,?)").run(p.id,s.id,data.trackId,data.total,JSON.stringify(data),now());
         db.prepare("UPDATE projects SET track_id=?,summary=? WHERE id=? AND NOT EXISTS(SELECT 1 FROM analyses WHERE project_id=? AND stale=0)").run(data.trackId,data.summary,p.id,p.id);
         indexProject(p.id);

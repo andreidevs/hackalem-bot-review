@@ -1,5 +1,6 @@
-import { db, project, latestAnalysis, getProject, getSnapshot, activeSql } from "./db.js";
+import { db, project, latestAnalysis, getProject, getSnapshot, activeSql, setting } from "./db.js";
 import { rankProjects } from "./analysis.js";
+import { tracks } from "./tracks.js";
 import type { Project } from "../shared/types.js";
 export function ftsQuery(q: string) {
   return (q.match(/[\p{L}\p{N}_-]+/gu) || [])
@@ -77,6 +78,41 @@ export function rankings(track?: number) {
       score: track ? r.total : r.common_total,
     })),
   );
+}
+// Overall top by the common scale plus top-3 per track by the track rubric, among finished code analyses.
+export function topProjects(overall = 50, perTrack = 3) {
+  const shortlist = setting<number[]>("shortlist", []);
+  const done = shortlist.length
+    ? (db.prepare(`SELECT count(*) n FROM analyses a WHERE a.stale=0 AND a.project_id IN (${shortlist.map(Number).join(",")})`).get() as { n: number }).n
+    : 0;
+  return {
+    overall: rankings().slice(0, overall),
+    byTrack: tracks.map((t) => ({ trackId: t.id, name: t.name, items: rankings(t.id).slice(0, perTrack) })),
+    shortlist: { total: shortlist.length, analyzed: done, maxParts: setting("maxParts", 8) },
+  };
+}
+// Shortlist for code analysis: best quick scores per track, then the overall best, then large
+// repositories whose README is only the template (the quick screen cannot judge those).
+export function buildShortlist(size = 100, perTrack = 6) {
+  const reviews = db
+    .prepare(
+      `SELECT p.id,p.size,q.total,coalesce(p.manual_track_id,q.track_id,json_extract(q.data,'$.candidates[0]')) track
+       FROM projects p JOIN quick_reviews q ON q.id=(SELECT max(id) FROM quick_reviews WHERE project_id=p.id)
+       WHERE q.stale=0 AND ${activeSql()} ORDER BY q.total DESC,p.id`,
+    )
+    .all() as { id: number; total: number; track: number | null }[];
+  const picked = new Set<number>();
+  for (const t of tracks)
+    for (const r of reviews.filter((r) => r.track === t.id).slice(0, perTrack)) picked.add(r.id);
+  for (const r of reviews) if (picked.size < size) picked.add(r.id);
+  const template = db
+    .prepare(
+      `SELECT p.id FROM projects p JOIN readme_sources s ON s.id=(SELECT max(id) FROM readme_sources WHERE project_id=p.id)
+       WHERE ${activeSql()} AND s.status IN ('template','missing') AND p.size>200 ORDER BY p.size DESC LIMIT 15`,
+    )
+    .all() as { id: number }[];
+  for (const r of template) picked.add(r.id);
+  return [...picked];
 }
 export function comparison(ids: number[]) {
   return ids.map((id) => {

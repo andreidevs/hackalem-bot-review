@@ -25,9 +25,11 @@ import {
   exportRanking,
   demoLinks,
   coverageReport,
+  topProjects,
+  buildShortlist,
 } from "./catalog.js";
 import { detectHarness, modelOptions } from "./harness.js";
-import { latestQuickReview, quickRankings } from "./quick.js";
+import { latestQuickReview, quickRankings, markOtherModelsStale } from "./quick.js";
 export const app = express();
 app.disable("x-powered-by");
 app.use((req, res, next) => {
@@ -374,6 +376,27 @@ app.post("/api/jobs/:id/cancel", (req, res) => {
   ).run(now(), idParam(req.params.id));
   res.json({ ok: true });
 });
+app.get("/api/top", (_req, res) => res.json(topProjects()));
+// Second stage for the top: code analysis of a shortlist with a low chunk cap to keep it fast.
+// Runs after the quick screen, since switching to full mode pauses it.
+app.post("/api/shortlist", (req, res) => {
+  const v = z
+    .object({ size: z.number().int().min(10).max(300).default(100), maxParts: z.number().int().min(1).max(8).default(2) })
+    .parse(req.body ?? {});
+  if (db.prepare("SELECT 1 FROM jobs WHERE type='quick' AND state IN ('queued','running')").get())
+    return res.status(409).json({ error: "Дождитесь окончания быстрого отбора: шорт-лист строится по его оценкам." });
+  const ids = buildShortlist(v.size);
+  const added = db.transaction(() => {
+    setSetting("shortlist", ids);
+    setSetting("maxParts", v.maxParts);
+    const count = ids.map(requestFullAnalysis).filter(Boolean).length;
+    setSetting("analysisMode", "full");
+    setSetting("paused", false);
+    setSetting("pauseReason", "");
+    return count;
+  })();
+  res.status(202).json({ shortlisted: ids.length, added });
+});
 // Activity window in hours (0 = all). A fresh sync refreshes pushed_at for every repo.
 app.patch("/api/settings/activity", (req, res) => {
   const { hours } = z.object({ hours: z.union([z.literal(0), z.literal(24), z.literal(48)]) }).parse(req.body);
@@ -442,6 +465,8 @@ app.patch("/api/harnesses", (req, res) => {
   setSetting("harness", v.harness);
   setSetting("model", v.model);
   setSetting("quickModel", v.quickModel);
+  // Reviews by another model leave the quick ranking; the next quick run redoes them.
+  markOtherModelsStale();
   setSetting("concurrency", v.concurrency);
   res.json({ ok: true });
 });

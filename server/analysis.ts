@@ -183,7 +183,8 @@ export function sourceChunks(files: SourceFile[], maxChars = 90000) {
   if (current.trim()) parts.push(current);
   return parts;
 }
-// ponytail: hard cap of 8 chunks (~720K chars) per project; raise MAX_PARTS and bump CHUNKING for fuller coverage.
+// ponytail: default cap of 8 chunks (~720K chars) per project; the "maxParts" setting lowers it for a fast shortlist.
+// Part contents do not depend on the cap, so cached parts stay valid when it changes.
 const MAX_PARTS = 8;
 const CHUNKING = "v2-weighted-8";
 function config() {
@@ -299,7 +300,7 @@ export async function analyzeProject(
     "UPDATE projects SET status='analyzing',track_id=? WHERE id=?",
   ).run(trackId, id);
   const allParts = sourceChunks(snapshot.files);
-  const parts = allParts.slice(0, MAX_PARTS);
+  const parts = allParts.slice(0, Math.max(1, setting("maxParts", MAX_PARTS)));
   const kept = parts.join("");
   const omitted = snapshot.files.filter((f) => !kept.includes(`\nFILE ${f.path}\n`)).length;
   let usedModel = "";

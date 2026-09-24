@@ -950,7 +950,7 @@ function QuickRankingPage({tracks,stats,params,revision}:{tracks:Track[];stats:S
     <div className="page-heading"><div><h1>Быстрый отбор</h1><p>Найдите перспективные идеи по README, затем проверьте их исходный код.</p></div><button className="button primary" disabled={busy || !stats?.total} onClick={()=>run(false)}><Play size={15}/>Оценить все README</button></div>
     <div className="notice">Предварительный рейтинг описаний, а не качества кода. Треки определяются автоматически; неоднозначные случаи требуют классификации. До 6 000 символов README на проект, до 12 проектов в запросе. Исходники и команды проектов не запускаются.</div>
     <div className="quick-progress"><strong>{fmt(data?.reviewed || 0)} / {fmt(stats?.total || 0)} README оценено</strong><span>{job?.progress || (stats?.paused ? stats.pauseReason : "Результаты сохраняются после каждого пакета")}</span></div>
-    {!!data?.statuses.length && <p className="muted">{data.statuses.filter(s=>s.status!=="ready").map(s=>`${({missing:"Нет README",empty:"Пустые",too_large:"README превышает лимит",error:"Ошибки загрузки"} as Record<string,string>)[s.status] || s.status}: ${s.count}`).join(" · ")}{data.stale ? ` · Устаревшие: ${data.stale}` : ""}. Без доступного README баллы не назначаются.</p>}
+    {!!data?.statuses.length && <p className="muted">{data.statuses.filter(s=>s.status!=="ready").map(s=>`${({missing:"Нет README",template:"Шаблонный README без описания",empty:"Пустые",too_large:"README превышает лимит",error:"Ошибки загрузки"} as Record<string,string>)[s.status] || s.status}: ${s.count}`).join(" · ")}{data.stale ? ` · Устаревшие: ${data.stale}` : ""}. Без доступного README баллы не назначаются.</p>}
     <div className="filters"><ActivityFilter stats={stats} /><input aria-label="Поиск в быстром рейтинге" placeholder="Команда или идея…" value={params.get("q") || ""} onChange={e=>change("q",e.target.value)}/><select aria-label="Трек быстрого рейтинга" value={params.get("track") || ""} onChange={e=>change("track",e.target.value)}><option value="">Все 12 треков</option>{tracks.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><Link to="/rankings" className="text-link">Рейтинг по исходному коду <ArrowRight size={14}/></Link></div>
     <div className="quick-actions"><button className="button" disabled={!data?.items.length} onClick={()=>setChosen(data!.items.slice(0,10).map(r=>r.projectId))}>Выбрать первые 10 на странице</button><button className="text-button" onClick={()=>setChosen([])}>Сбросить</button><button className="button primary" disabled={!chosen.length || busy} onClick={()=>run(true)}><Code2 size={15}/>Проверить код выбранных ({chosen.length})</button></div>
     {notice && <div role="status" className="notice">{notice}</div>}<ErrorBox message={error}/>
@@ -1579,6 +1579,101 @@ function SourceViewer({
     </div>
   );
 }
+type Ranked = Project & { score: number; rank: number };
+function RankingRow({ p, tracks }: { p: Ranked; tracks: Track[] }) {
+  return (
+    <Link to={`/project/${p.id}`} className="ranking-row">
+      <span className="rank">{String(p.rank).padStart(2, "0")}</span>
+      <div>
+        <h3>{p.team}</h3>
+        <p>{p.summary}</p>
+        <small>
+          {tracks.find((t) => t.id === p.trackId)?.name || "Трек не определён"}
+        </small>
+      </div>
+      <span className="ranking-score">
+        {p.score}
+        <small>/100</small>
+      </span>
+      <ArrowUpRight size={18} />
+    </Link>
+  );
+}
+// Final view: overall top-50 on the common scale and top-3 per track on the track rubric.
+function TopView({ tracks, revision }: { tracks: Track[]; revision: unknown }) {
+  const [notice, setNotice] = useState("");
+  const [tick, setTick] = useState(0);
+  const { data, error } = useApi<{
+    overall: Ranked[];
+    byTrack: { trackId: number; name: string; items: Ranked[] }[];
+    shortlist: { total: number; analyzed: number; maxParts: number };
+  }>("/top", `${revision}:${tick}`);
+  async function start() {
+    if (
+      !confirm(
+        "Отобрать ~100 лучших по быстрой оценке (по 6 в каждом треке) и проверить их код в облегчённом режиме (до 2 частей кода на проект). Это займёт около 1–1,5 часа. Продолжить?",
+      )
+    )
+      return;
+    try {
+      const r = await api<{ shortlisted: number; added: number }>("/shortlist", {});
+      setNotice(`В шорт-листе ${r.shortlisted} проектов, анализ кода запущен.`);
+      setTick((n) => n + 1);
+    } catch (e) {
+      setNotice((e as Error).message);
+    }
+  }
+  const s = data?.shortlist;
+  return (
+    <>
+      <ErrorBox message={error} />
+      {notice && <div className="notice">{notice}</div>}
+      <div className="filters">
+        <button className="button primary" onClick={start}>
+          <Play size={15} /> Собрать шорт-лист и проверить код
+        </button>
+        {!!s?.total && (
+          <span className="muted">
+            Код проверен: {s.analyzed} из {s.total} (до {s.maxParts} частей кода на проект)
+          </span>
+        )}
+      </div>
+      {!data ? (
+        <Loading />
+      ) : !data.overall.length ? (
+        <Empty
+          title="Топ ещё не сформирован"
+          detail="Запустите шорт-лист после быстрого отбора: топ строится только по проверенному коду."
+          icon={BarChart3}
+        />
+      ) : (
+        <>
+          <h2>Общий топ-{data.overall.length}</h2>
+          <div className="ranking-list">
+            {data.overall.map((p) => (
+              <RankingRow key={p.id} p={p} tracks={tracks} />
+            ))}
+          </div>
+          <h2>Топ-3 по трекам</h2>
+          {data.byTrack.map((t) => (
+            <section key={t.trackId}>
+              <h3>{t.name}</h3>
+              {t.items.length ? (
+                <div className="ranking-list">
+                  {t.items.map((p) => (
+                    <RankingRow key={p.id} p={p} tracks={tracks} />
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">Пока нет проверенных проектов этого трека.</p>
+              )}
+            </section>
+          ))}
+        </>
+      )}
+    </>
+  );
+}
 function Rankings({
   tracks,
   params,
@@ -1590,7 +1685,7 @@ function Rankings({
 }) {
   const track = params.get("track") || "";
   const { data, error } = useApi<(Project & { score: number; rank: number })[]>(
-    "/rankings" + (track ? `?track=${track}` : ""),
+    track === "top" ? null : "/rankings" + (track ? `?track=${track}` : ""),
     revision,
   );
   return (
@@ -1635,6 +1730,7 @@ function Rankings({
             )
           }
         >
+          <option value="top">Топ-50 и топ-3 по трекам</option>
           <option value="">Общий аналитический рейтинг</option>
           {tracks.map((t) => (
             <option value={t.id} key={t.id}>
@@ -1642,10 +1738,14 @@ function Rankings({
             </option>
           ))}
         </select>
-        <span className="muted">{data?.length || 0} оценённых проектов</span>
+        {track !== "top" && (
+          <span className="muted">{data?.length || 0} оценённых проектов</span>
+        )}
       </div>
       <ErrorBox message={error} />
-      {!data ? (
+      {track === "top" ? (
+        <TopView tracks={tracks} revision={revision} />
+      ) : !data ? (
         <Loading />
       ) : !data.length ? (
         <Empty
@@ -1656,22 +1756,7 @@ function Rankings({
       ) : (
         <div className="ranking-list">
           {data.map((p) => (
-            <Link key={p.id} to={`/project/${p.id}`} className="ranking-row">
-              <span className="rank">{String(p.rank).padStart(2, "0")}</span>
-              <div>
-                <h3>{p.team}</h3>
-                <p>{p.summary}</p>
-                <small>
-                  {tracks.find((t) => t.id === p.trackId)?.name ||
-                    "Трек не определён"}
-                </small>
-              </div>
-              <span className="ranking-score">
-                {p.score}
-                <small>/100</small>
-              </span>
-              <ArrowUpRight size={18} />
-            </Link>
+            <RankingRow key={p.id} p={p} tracks={tracks} />
           ))}
         </div>
       )}
@@ -2282,6 +2367,10 @@ function Settings({
             options={harnesses?.models[harness] || []}
             fallback="Как у полного анализа"
           />
+          <p className="muted">
+            Смена модели быстрого отбора выводит прежние оценки из рейтинга: он
+            строится одной моделью. Следующий быстрый отбор переоценит проекты.
+          </p>
           <label className="field-label">
             Параллельных AI-вызовов
             <input

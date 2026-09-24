@@ -833,3 +833,29 @@ it("hides and skips projects without a push inside the activity window", async (
     setSetting("activityHours", 0);
   }
 });
+
+it("shortlists per-track leaders before the overall best", async () => {
+  const { buildShortlist } = await import("../server/catalog.js");
+  const ids = (db.prepare("SELECT id FROM projects ORDER BY id LIMIT 4").all() as { id: number }[]).map((r) => r.id);
+  const t = new Date().toISOString();
+  db.prepare("UPDATE projects SET manual_track_id=NULL,track_id=NULL").run();
+  const review = (id: number, track: number, total: number) => {
+    const sid = Number(db.prepare("INSERT INTO readme_sources(project_id,sha,path,text,status,revision,created_at) VALUES(?,?,?,?,?,?,?)").run(id, "a".repeat(40), "README.md", "x".repeat(400), "ready", t, t).lastInsertRowid);
+    db.prepare("INSERT INTO quick_reviews(project_id,source_id,track_id,total,data,created_at) VALUES(?,?,?,?,?,?)").run(id, sid, track, total, JSON.stringify({ trackId: track, candidates: [track] }), t);
+  };
+  // Track 1 has three strong projects; track 2 has one weak project that must still make the list.
+  review(ids[0], 1, 95);
+  review(ids[1], 1, 94);
+  review(ids[2], 1, 93);
+  review(ids[3], 2, 10);
+  const picked = buildShortlist(2, 1);
+  expect(picked).toContain(ids[0]);
+  expect(picked).toContain(ids[3]);
+  expect(picked).not.toContain(ids[2]);
+});
+
+it("recognizes the organization template README as having no description", async () => {
+  const { isTemplateReadme } = await import("../server/quick.js");
+  expect(isTemplateReadme("# hack-1-geeks\nHackathon team repository for Geeks\n")).toBe(true);
+  expect(isTemplateReadme("# Хаттама\n\nИИ-секретарь совещаний: протокол с поручениями и сроками.")).toBe(false);
+});
