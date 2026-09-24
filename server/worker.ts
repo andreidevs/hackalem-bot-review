@@ -13,6 +13,7 @@ import {
 import { syncOrganization, snapshotProject, PauseError } from "./github.js";
 import { analyzeProject } from "./analysis.js";
 import { answerChat } from "./chat.js";
+import { quickScan } from "./quick.js";
 const lock = join(dataDir, "worker.pid");
 function processStart(pid: number) {
   try {
@@ -70,9 +71,9 @@ try {
     }
     const raw = db
       .prepare(
-        "SELECT * FROM jobs WHERE state='queued' ORDER BY coalesce(json_extract(payload,'$.priority'),CASE type WHEN 'sync' THEN -30 WHEN 'chat' THEN -20 WHEN 'snapshot' THEN 0 ELSE 10 END),id LIMIT 1",
+        "SELECT * FROM jobs WHERE state='queued' AND (type IN ('sync','chat') OR (type='quick' AND ?='quick') OR (type IN ('snapshot','analyze') AND ?='full' AND json_extract(payload,'$.mode')='full')) ORDER BY coalesce(json_extract(payload,'$.priority'),CASE type WHEN 'sync' THEN -30 WHEN 'chat' THEN -20 WHEN 'quick' THEN -15 WHEN 'snapshot' THEN 0 ELSE 10 END),id LIMIT 1",
       )
-      .get();
+      .get(setting("analysisMode","quick"),setting("analysisMode","quick"));
     if (!raw) {
       await new Promise((r) => setTimeout(r, 700));
       continue;
@@ -82,11 +83,17 @@ try {
       "UPDATE jobs SET state='running',attempts=attempts+1,error=NULL,updated_at=? WHERE id=?",
     ).run(now(), job.id);
     active = new AbortController();
+    let modeChanged = false;
     const cancellation = setInterval(() => {
       const row = db
         .prepare("SELECT state FROM jobs WHERE id=?")
         .get(job.id) as { state: string };
       if (row.state === "cancelled") active?.abort();
+      const mode = setting<string>("analysisMode","quick");
+      if ((job.type === "quick" && mode !== "quick") || (["snapshot","analyze"].includes(job.type) && mode !== "full")) {
+        modeChanged = true;
+        active?.abort();
+      }
     }, 500);
     try {
       let result: unknown;
@@ -100,6 +107,13 @@ try {
         result = await snapshotProject(job.id, job.projectId!, active.signal);
       else if (job.type === "analyze")
         result = await analyzeProject(job.id, job.projectId!, active.signal);
+      else if (job.type === "quick") {
+        result = await quickScan(job.id, active.signal);
+        if ((result as any)?.continue) {
+          db.prepare("UPDATE jobs SET state='queued',updated_at=? WHERE id=? AND state='running'").run(now(),job.id);
+          continue;
+        }
+      }
       else
         result = await answerChat(
           String(job.payload.question),
@@ -117,7 +131,7 @@ try {
         db.prepare(
           "UPDATE jobs SET state='queued',error=?,updated_at=? WHERE id=? AND state='running'",
         ).run(message, now(), job.id);
-      } else if (stopped)
+      } else if (stopped || modeChanged)
         db.prepare(
           "UPDATE jobs SET state='queued',updated_at=? WHERE id=? AND state='running'",
         ).run(now(), job.id);

@@ -6,6 +6,7 @@ import {
   db,
   enqueue,
   enqueueAllAnalyses,
+  requestFullAnalysis,
   getProject,
   getSnapshot,
   latestAnalysis,
@@ -25,6 +26,7 @@ import {
   coverageReport,
 } from "./catalog.js";
 import { detectHarness } from "./harness.js";
+import { latestQuickReview, quickRankings } from "./quick.js";
 export const app = express();
 app.disable("x-powered-by");
 app.use((req, res, next) => {
@@ -70,6 +72,8 @@ app.get("/api/health", (_req, res) => res.json({ ok: true }));
 function stats() {
   return {
     total: (db.prepare("SELECT count(*) n FROM projects").get() as any).n,
+    analysisMode: setting("analysisMode", "quick"),
+    quickReviewed: (db.prepare("SELECT count(*) n FROM quick_reviews q JOIN readme_sources s ON s.id=q.source_id JOIN projects p ON p.id=q.project_id WHERE q.id=(SELECT max(id) FROM quick_reviews WHERE project_id=p.id) AND q.stale=0 AND s.revision=p.updated_at").get() as any).n,
     snapshots: (
       db
         .prepare(
@@ -174,6 +178,8 @@ app.get("/api/projects/:id", (req, res) => {
     project: p,
     snapshot: s ? { ...s, files: s.files.map(({ text, ...f }) => f) } : null,
     analysis: latestAnalysis(id),
+    quickReview: latestQuickReview(id),
+    readmeSource: db.prepare("SELECT id,path,text,sha,status,created_at FROM readme_sources WHERE project_id=? ORDER BY id DESC LIMIT 1").get(id) || null,
     history: db
       .prepare(
         "SELECT id,total,common_total AS commonTotal,created_at AS createdAt,stale,snapshot_id AS snapshotId FROM analyses WHERE project_id=? ORDER BY id DESC",
@@ -220,6 +226,7 @@ app.patch("/api/projects/:id", (req, res) => {
       id,
     );
     db.prepare("UPDATE analyses SET stale=1 WHERE project_id=?").run(id);
+    db.prepare("UPDATE quick_reviews SET stale=1 WHERE project_id=?").run(id);
   })();
   res.json({ ok: true });
 });
@@ -286,6 +293,34 @@ app.get("/api/jobs/:id", (req, res) => {
 app.post("/api/jobs/analyze-all", (_req, res) => {
   res.status(202).json(enqueueAllAnalyses());
 });
+app.get("/api/quick/rankings", (req, res) => {
+  const q = z.object({track:z.coerce.number().int().min(1).max(12).optional(),q:z.string().max(200).default(""),page:z.coerce.number().int().min(1).max(100000).default(1)}).parse(req.query);
+  res.json(quickRankings(q.track,q.q,q.page));
+});
+app.get("/api/readmes/:id", (req,res) => {
+  const row = db.prepare("SELECT * FROM readme_sources WHERE id=?").get(idParam(req.params.id));
+  row ? res.json(row) : res.status(404).json({error:"README не найден"});
+});
+app.post("/api/quick/start", (req,res) => {
+  const value = z.object({projectId:z.number().int().positive().optional()}).parse(req.body || {});
+  if(value.projectId && !getProject(value.projectId)) return res.status(404).json({error:"Проект не найден"});
+  const id = db.transaction(() => {
+    const id = enqueue("quick",value.projectId ?? null,{priority:-15});
+    setSetting("analysisMode","quick"); setSetting("paused",false); setSetting("pauseReason","");
+    return id;
+  })();
+  res.status(202).json({id});
+});
+app.post("/api/jobs/analyze-selected", (req,res) => {
+  const ids = z.array(z.number().int().positive()).min(1).max(50).refine(a=>new Set(a).size===a.length).parse(req.body.ids);
+  if(ids.some(id=>!getProject(id))) return res.status(400).json({error:"Проект не найден"});
+  const added = db.transaction(() => {
+    const count = ids.map(requestFullAnalysis).filter(Boolean).length;
+    setSetting("analysisMode","full");setSetting("paused",false);setSetting("pauseReason","");
+    return count;
+  })();
+  res.status(202).json({added,alreadyQueued:ids.length-added});
+});
 app.post("/api/jobs", (req, res) => {
   const value = z
     .object({
@@ -295,11 +330,19 @@ app.post("/api/jobs", (req, res) => {
     .parse(req.body);
   if (value.type !== "sync" && !getProject(value.projectId || 0))
     return res.status(400).json({ error: "Укажите существующий проект" });
+  if (value.type === "analyze") {
+    setSetting("analysisMode","full");
+    return res.json({id:requestFullAnalysis(value.projectId!)});
+  }
+  if (value.type === "snapshot") {
+    setSetting("analysisMode","full");
+    db.prepare("UPDATE jobs SET payload=json_set(payload,'$.mode','full','$.priority',-11) WHERE type='snapshot' AND project_id=? AND state IN ('queued','running')").run(value.projectId!);
+  }
   res.json({
     id: enqueue(
       value.type,
       value.projectId ?? null,
-      value.type === "analyze" ? { priority: -10 } : {},
+      value.type === "snapshot" ? { priority: -11, mode:"full" } : {},
     ),
   });
 });

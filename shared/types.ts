@@ -121,7 +121,7 @@ export interface Snapshot {
 }
 export interface Job {
   id: number;
-  type: "sync" | "snapshot" | "analyze" | "chat";
+  type: "sync" | "snapshot" | "analyze" | "chat" | "quick";
   projectId: number | null;
   state: "queued" | "running" | "done" | "failed" | "cancelled";
   payload: Record<string, unknown>;
@@ -141,6 +141,34 @@ export interface HarnessInfo {
   note: string;
   model: string;
 }
+export interface QuickReview {
+  id: number;
+  projectId: number;
+  sourceId: number;
+  team: string;
+  sha: string;
+  path: string | null;
+  trackId: number | null;
+  candidates: number[];
+  summary: string;
+  strengths: string[];
+  risks: string[];
+  scores: Score[];
+  total: number;
+  rank?: number;
+  stale: boolean;
+  model: string;
+  methodVersion: string;
+  createdAt: string;
+  truncated: boolean;
+  reviewedChars: number;
+}
+export const QUICK_RUBRIC: Criterion[] = [
+  { id: "clarity", title: "Ясность задачи и решения", max: 30 },
+  { id: "value", title: "Заявленная польза", max: 30 },
+  { id: "originality", title: "Отличия идеи", max: 20 },
+  { id: "detail", title: "Конкретика описания", max: 20 },
+];
 export const VERDICTS: Record<Verdict, string> = {
   code: "Подтверждено кодом",
   readme: "Заявлено в README",

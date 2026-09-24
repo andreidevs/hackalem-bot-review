@@ -42,6 +42,7 @@ export function listProjects(
   }
   if (params.status) {
     if (params.status === "stale") conditions.push("a.stale=1");
+    else if (params.status === "unclassified") conditions.push("(p.status='unclassified' OR (coalesce(p.manual_track_id,p.track_id) IS NULL AND EXISTS(SELECT 1 FROM quick_reviews WHERE project_id=p.id AND stale=0)))");
     else {
       conditions.push("p.status=?");
       args.push(params.status);

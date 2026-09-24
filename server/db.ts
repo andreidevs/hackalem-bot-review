@@ -24,6 +24,10 @@ CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state,type,id);
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_active ON jobs(type,coalesce(project_id,0)) WHERE state IN ('queued','running') AND type != 'chat';
 CREATE INDEX IF NOT EXISTS analyses_project ON analyses(project_id,id DESC);
 CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id),text TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS readme_sources(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id),sha TEXT NOT NULL,path TEXT,text TEXT NOT NULL,status TEXT NOT NULL,revision TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS readme_sources_project ON readme_sources(project_id,id DESC);
+CREATE TABLE IF NOT EXISTS quick_reviews(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id),source_id INTEGER NOT NULL REFERENCES readme_sources(id),track_id INTEGER,total REAL NOT NULL,data TEXT NOT NULL,created_at TEXT NOT NULL,stale INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS quick_reviews_project ON quick_reviews(project_id,id DESC);
 `);
 if (
   !(db.prepare("PRAGMA table_info(projects)").all() as { name: string }[]).some(
@@ -105,7 +109,7 @@ export function indexProject(id: number) {
     ? (db
         .prepare("SELECT readme FROM snapshots WHERE id=?")
         .get(p.snapshotId) as { readme: string } | undefined)
-    : undefined;
+    : (db.prepare("SELECT text AS readme FROM readme_sources WHERE project_id=? ORDER BY id DESC LIMIT 1").get(id) as {readme: string} | undefined);
   db.transaction(() => {
     db.prepare("DELETE FROM project_search WHERE rowid=?").run(id);
     db.prepare(
@@ -212,6 +216,7 @@ export const enqueueAllAnalyses = db.transaction(() => {
   }[];
   // Interleave analysis with downloads after an explicit bulk launch.
   setSetting("analysisPriority", -10);
+  setSetting("analysisMode", "full");
   for (const p of projects) {
     if (p.status === "empty") {
       result.empty++;
@@ -226,12 +231,21 @@ export const enqueueAllAnalyses = db.transaction(() => {
     else result.alreadyQueued++;
   }
   db.prepare(
-    "UPDATE jobs SET payload=json_set(payload,'$.priority',-10),updated_at=? WHERE type='analyze' AND state='queued'",
+    "UPDATE jobs SET payload=json_set(payload,'$.priority',-10,'$.mode','full'),updated_at=? WHERE type='analyze' AND state='queued'",
   ).run(now());
+  db.prepare("UPDATE jobs SET payload=json_set(payload,'$.mode','full') WHERE type='snapshot' AND state IN ('queued','running')").run();
   setSetting("paused", false);
   setSetting("pauseReason", "");
   return result;
 });
+export function requestFullAnalysis(id: number) {
+  const p = getProject(id);
+  if (!p) throw new Error("Проект не найден");
+  const type = p.snapshotId ? "analyze" : "snapshot";
+  const job = enqueue(type, id, { mode: "full", priority: type === "snapshot" ? -11 : -10 });
+  db.prepare("UPDATE jobs SET payload=json_set(payload,'$.mode','full','$.priority',?),updated_at=? WHERE type=? AND project_id=? AND state IN ('queued','running')").run(type === "snapshot" ? -11 : -10, now(), type, id);
+  return job;
+}
 export function parseJob(j: any): Job {
   return {
     id: j.id,

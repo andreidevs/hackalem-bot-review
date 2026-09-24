@@ -33,6 +33,7 @@ import {
   Activity,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
+import { QUICK_RUBRIC, type QuickReview } from "../shared/types.js";
 import remarkGfm from "remark-gfm";
 import rehypeSanitize from "rehype-sanitize";
 import type {
@@ -217,6 +218,8 @@ function Markdown({ text, base }: { text: string; base?: string }) {
 }
 type Stats = {
   total: number;
+  quickReviewed: number;
+  analysisMode: "quick" | "full";
   snapshots: number;
   analyzed: number;
   empty: number;
@@ -235,8 +238,10 @@ function App() {
     [selected, setSelected] = useState<number[]>([]),
     [toast, setToast] = useState(""),
     [startingAll, setStartingAll] = useState(false),
+    [analysisMode, setAnalysisMode] = useState<"quick" | "full">("quick"),
     [revision, setRevision] = useState(0);
   const refresh = () => setRevision((n) => n + 1);
+  useEffect(() => { if(stats?.analysisMode) setAnalysisMode(stats.analysisMode); },[stats?.analysisMode]);
   useEffect(() => {
     const change = () =>
       setLocation(window.location.pathname + window.location.search);
@@ -255,7 +260,7 @@ function App() {
   }, [toast]);
   const { data: tracks } = useApi<Track[]>(
     "/tracks",
-    `${stats?.analyzed}:${revision}`,
+    `${stats?.analyzed}:${stats?.quickReviewed}:${revision}`,
   );
   const path = location.split("?")[0],
     params = new URLSearchParams(location.split("?")[1]);
@@ -281,6 +286,13 @@ function App() {
     if (startingAll) return;
     setStartingAll(true);
     try {
+      if (analysisMode === "quick") {
+        await api("/quick/start", {});
+        setToast("Быстрый анализ README запущен. Полный анализ кода отложен; результаты сохраняются по пакетам.");
+        refresh();
+        navigate("/quick");
+        return;
+      }
       const result = await api<{
         added: number;
         alreadyQueued: number;
@@ -299,6 +311,7 @@ function App() {
   }
   const nav = [
     ["/", "Каталог", Layers],
+    ["/quick", "Быстрый отбор", FileText],
     ["/rankings", "Рейтинги", BarChart3],
     ["/compare", "Сравнение", SlidersHorizontal],
     ["/chat", "AI-ассистент", MessageSquare],
@@ -401,15 +414,19 @@ function App() {
               className="button primary"
               onClick={analyzeAll}
               disabled={startingAll || !stats?.total}
-              title="Запустить очередь для всех проектов без актуальной оценки. Недостающие исходники загрузятся автоматически."
+              title={analysisMode === "quick" ? "Только README: определить треки и оценить перспективность описаний" : "Полный анализ исходного кода всех проектов без актуальной оценки"}
             >
               {startingAll ? (
                 <Loader2 size={15} className="spin" />
               ) : (
                 <Play size={15} />
               )}
-              {startingAll ? "Запускаем…" : "Оценить все проекты"}
+              {startingAll ? "Запускаем…" : analysisMode === "quick" ? "Быстрый анализ всех" : "Полный анализ всех"}
             </button>
+            <select className="mode-select" aria-label="Режим анализа" value={analysisMode} onChange={e=>setAnalysisMode(e.target.value as "quick" | "full")}>
+              <option value="quick">Быстрый · README</option>
+              <option value="full">Полный · исходный код</option>
+            </select>
             <span className="avatar">A</span>
           </div>
         </header>
@@ -424,12 +441,16 @@ function App() {
               revision={revision}
               sync={sync}
             />
+          ) : path === "/quick" ? (
+            <QuickRankingPage tracks={tracks || []} stats={stats} params={params} revision={revision} />
+          ) : path.startsWith("/readme/") ? (
+            <ReadmeSourcePage id={Number(path.split("/")[2])} line={Number(params.get("line")) || 1} />
           ) : path.startsWith("/project/") ? (
             <ProjectPage
               id={Number(path.split("/")[2])}
               tracks={tracks || []}
               params={params}
-              revision={`${revision}:${stats?.analyzed}`}
+              revision={`${revision}:${stats?.analyzed}:${stats?.quickReviewed}`}
               refresh={refresh}
             />
           ) : path.startsWith("/specification/") ? (
@@ -550,7 +571,7 @@ function Catalog({
     limit: number;
   }>(
     "/projects?" + query,
-    `${revision}:${stats?.total}:${stats?.snapshots}:${stats?.analyzed}`,
+    `${revision}:${stats?.total}:${stats?.snapshots}:${stats?.analyzed}:${stats?.quickReviewed}`,
   );
   const track = tracks.find((t) => t.id === Number(params.get("track")));
   const coverage = stats?.total
@@ -600,7 +621,7 @@ function Catalog({
           </strong>
         </div>
         <div>
-          <span>Предварительно оценено</span>
+          <span>Полный анализ кода</span>
           <strong>
             {fmt(stats?.analyzed || 0)}
             <small>проектов</small>
@@ -618,14 +639,18 @@ function Catalog({
               ? "Обработка на паузе"
               : stats?.running[0]?.type === "analyze"
                 ? "Анализ продолжается"
-                : stats?.queued
-                  ? "Очередь обрабатывается"
+                : stats?.running.length
+                  ? stats.running[0].type === "quick" ? "Быстрый анализ README" : "Очередь обрабатывается"
                   : "Готов к работе"}
             <Link to="/settings">
               <ArrowRight size={14} />
             </Link>
           </small>
         </div>
+      </div>
+      <div className="mode-overview">
+        <Link to="/quick"><FileText size={21}/><div><strong>01 · Быстрый отбор по README</strong><p>Определение треков и перспективных идей. Оценено: {fmt(stats?.quickReviewed || 0)}.</p></div><ArrowRight size={17}/></Link>
+        <Link to="/rankings"><Code2 size={21}/><div><strong>02 · Полная проверка кода</strong><p>Подтвердить заявления описания исходниками и доказательствами.</p></div><ArrowRight size={17}/></Link>
       </div>
       <div className="tabs">
         <button
@@ -869,6 +894,54 @@ function EvidenceLinks({
     </div>
   );
 }
+function QuickRankingPage({tracks,stats,params,revision}:{tracks:Track[];stats:Stats|null;params:URLSearchParams;revision:number}) {
+  const [chosen,setChosen] = useState<number[]>([]), [notice,setNotice] = useState(""), [busy,setBusy] = useState(false);
+  const {data,error} = useApi<{items:QuickReview[];total:number;page:number;limit:number;reviewed:number;stale:number;statuses:{status:string;count:number}[]}>(`/quick/rankings?${params}`,`${revision}:${stats?.quickReviewed}:${stats?.running[0]?.progress}`);
+  function change(key:string,value:string) { const next = new URLSearchParams(params); value ? next.set(key,value) : next.delete(key); if(key!=="page")next.delete("page");navigate(`/quick?${next}`); }
+  async function run(full:boolean) {
+    setBusy(true);setNotice("");
+    try {
+      if(full) {
+        await api("/jobs/analyze-selected",{ids:chosen});
+        setNotice(`Полная проверка выбранных проектов (${chosen.length}) запущена. Прогресс — в «Обработка и настройки».`);
+      } else {
+        await api("/quick/start",{});
+        setNotice("Быстрый отбор запущен. Готовые оценки используются повторно; полный анализ отложен.");
+      }
+    } catch(e) { setNotice((e as Error).message); } finally { setBusy(false); }
+  }
+  const job = stats?.running.find(j=>j.type==="quick");
+  return <>
+    <div className="eyebrow">ЭТАП 01 · ТОЛЬКО ОПИСАНИЕ</div>
+    <div className="page-heading"><div><h1>Быстрый отбор</h1><p>Найдите перспективные идеи по README, затем проверьте их исходный код.</p></div><button className="button primary" disabled={busy || !stats?.total} onClick={()=>run(false)}><Play size={15}/>Оценить все README</button></div>
+    <div className="notice">Предварительный рейтинг описаний, а не качества кода. Треки определяются автоматически; неоднозначные случаи требуют классификации. До 6 000 символов README на проект, до 12 проектов в запросе. Исходники и команды проектов не запускаются.</div>
+    <div className="quick-progress"><strong>{fmt(data?.reviewed || 0)} / {fmt(stats?.total || 0)} README оценено</strong><span>{job?.progress || (stats?.paused ? stats.pauseReason : "Результаты сохраняются после каждого пакета")}</span></div>
+    {!!data?.statuses.length && <p className="muted">{data.statuses.filter(s=>s.status!=="ready").map(s=>`${({missing:"Нет README",empty:"Пустые",too_large:"README превышает лимит",error:"Ошибки загрузки"} as Record<string,string>)[s.status] || s.status}: ${s.count}`).join(" · ")}{data.stale ? ` · Устаревшие: ${data.stale}` : ""}. Без доступного README баллы не назначаются.</p>}
+    <div className="filters"><input aria-label="Поиск в быстром рейтинге" placeholder="Команда или идея…" value={params.get("q") || ""} onChange={e=>change("q",e.target.value)}/><select aria-label="Трек быстрого рейтинга" value={params.get("track") || ""} onChange={e=>change("track",e.target.value)}><option value="">Все 12 треков</option>{tracks.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><Link to="/rankings" className="text-link">Рейтинг по исходному коду <ArrowRight size={14}/></Link></div>
+    <div className="quick-actions"><button className="button" disabled={!data?.items.length} onClick={()=>setChosen(data!.items.slice(0,10).map(r=>r.projectId))}>Выбрать первые 10 на странице</button><button className="text-button" onClick={()=>setChosen([])}>Сбросить</button><button className="button primary" disabled={!chosen.length || busy} onClick={()=>run(true)}><Code2 size={15}/>Проверить код выбранных ({chosen.length})</button></div>
+    {notice && <div role="status" className="notice">{notice}</div>}<ErrorBox message={error}/>
+    {!data ? <Loading/> : !data.items.length ? <Empty title="Здесь появится отбор по README" detail="Запустите быстрый анализ. Результаты и треки будут появляться по мере обработки пакетов." icon={FileText}/> : <div className="quick-list">{data.items.map(r=><article className="quick-row" key={r.id}><input type="checkbox" aria-label={`Проверить код ${r.team}`} checked={chosen.includes(r.projectId)} disabled={chosen.length>=50 && !chosen.includes(r.projectId)} onChange={()=>setChosen(a=>a.includes(r.projectId)?a.filter(id=>id!==r.projectId):[...a,r.projectId])}/><span className="rank">{r.rank}</span><div><Link to={`/project/${r.projectId}?tab=quick`}><h3>{r.team}</h3></Link><p>{r.summary}</p><span className="badge">{tracks.find(t=>t.id===r.trackId)?.name || "Требует классификации"}</span>{!r.trackId && r.candidates.length>0 && <small> Возможные треки: {r.candidates.map(id=>tracks.find(t=>t.id===id)?.name).join(", ")}</small>}<p className="muted">{r.risks[0]}</p><Link className="text-link" to={`/readme/${r.sourceId}`}>README · {r.sha.slice(0,8)} <ArrowUpRight size={13}/></Link></div><div className="ranking-score">{r.total}<small>/100 · описание</small></div></article>)}</div>}
+    {data && data.total>40 && <div className="pagination"><button className="button" disabled={data.page<=1} onClick={()=>change("page",String(data.page-1))}>Назад</button><span>{data.page} / {Math.ceil(data.total/40)}</span><button className="button" disabled={data.page*40>=data.total} onClick={()=>change("page",String(data.page+1))}>Далее</button></div>}
+  </>;
+}
+function QuickAssessment({review:r,tracks}:{review:QuickReview;tracks:Track[]}) {
+  return <>
+    <div className="notice">Быстрый анализ README · код не изучался · {r.total}/100 за описание{r.stale && <strong>Оценка устарела</strong>}</div>
+    <h2>{tracks.find(t=>t.id===r.trackId)?.name || "Требует классификации"}</h2>
+    {!r.trackId && <p>Возможные треки: {r.candidates.map(id=>tracks.find(t=>t.id===id)?.name).join(", ") || "Недостаточно данных"}</p>}
+    <p>{r.summary}</p><div className="two-columns"><section><h3>Почему стоит проверить</h3><ul>{r.strengths.map((s,i)=><li key={i}>{s}</li>)}</ul></section><section><h3>Что проверить по коду</h3><ul>{r.risks.map((s,i)=><li key={i}>{s}</li>)}</ul></section></div>
+    <div className="score-list">{r.scores.map(s=><section key={s.id}><h3>{QUICK_RUBRIC.find(c=>c.id===s.id)?.title} · {s.points}/{QUICK_RUBRIC.find(c=>c.id===s.id)?.max}</h3><p>{s.rationale}</p><div className="evidence-links">{s.evidence.map((e,i)=><Link key={i} to={`/readme/${r.sourceId}?line=${e.start}`} title={e.quote}>{e.path}:{e.start}–{e.end}</Link>)}</div></section>)}</div>
+    <p className="muted">{r.model} · {date(r.createdAt)} · {r.methodVersion} · прочитано {fmt(r.reviewedChars)} символов{r.truncated ? " · README усечён" : " · README целиком"}. SHA {r.sha}.</p>
+  </>;
+}
+function ReadmeSourcePage({id,line}:{id:number;line:number}) {
+  const {data,error} = useApi<{path:string|null;sha:string;text:string;project_id:number;status:string}>(`/readmes/${id}`);
+  const highlight = useRef<HTMLDivElement>(null);
+  useEffect(()=>{highlight.current?.scrollIntoView({block:"center"});},[data,line]);
+  if(error)return <ErrorBox message={error}/>;
+  if(!data)return <Loading/>;
+  return <><Link className="back" to={`/project/${data.project_id}?tab=quick`}><ArrowLeft size={14}/>К быстрой оценке проекта</Link><h1>{data.path || "README"}</h1><p className="muted">Сохранённый источник · SHA {data.sha}</p><div className="readme-lines">{data.text.split("\n").map((text,i)=><div key={i} ref={i+1===line ? highlight : undefined} className={i+1===line ? "highlight" : ""}><span>{i+1}</span><code>{text || " "}</code></div>)}</div></>;
+}
 type Detail = {
   demoUrls: string[];
   project: Project;
@@ -876,6 +949,8 @@ type Detail = {
     | (Omit<Snapshot, "files"> & { files: Omit<SourceFile, "text">[] })
     | null;
   analysis: Analysis | null;
+  quickReview: QuickReview | null;
+  readmeSource: {id:number;path:string|null;text:string;sha:string;status:string} | null;
   history: {
     id: number;
     total: number;
@@ -900,13 +975,13 @@ function ProjectPage({
   refresh: () => void;
 }) {
   const { data, error } = useApi<Detail>(`/projects/${id}`, revision);
-  const [tab, setTab] = useState("overview"),
+  const [tab, setTab] = useState(params.get("tab") || "overview"),
     [notice, setNotice] = useState(""),
     [note, setNote] = useState("");
   useEffect(() => {
-    setTab("overview");
+    setTab(params.get("tab") || "overview");
     setNotice("");
-  }, [id]);
+  }, [id,params.get("tab")]);
   const oldId = params.get("analysis");
   const { data: oldAnalysis } = useApi<Analysis>(
     oldId ? `/analyses/${oldId}` : null,
@@ -925,7 +1000,8 @@ function ProjectPage({
     savedTrack || tracks.find((t) => t.id === (a?.trackId ?? p.trackId));
   async function action(type: string) {
     try {
-      await api("/jobs", { type, projectId: id });
+      if(type === "quick") await api("/quick/start", {projectId:id});
+      else await api("/jobs", { type, projectId: id });
       setNotice("Задание добавлено в очередь");
       refresh();
     } catch (e) {
@@ -978,12 +1054,15 @@ function ProjectPage({
           Обновить снимок
         </button>
         <button
+          className="button small"
+          onClick={() => action("quick")}
+        ><FileText size={13}/>Быстрый · README</button>
+        <button
           className="button small primary"
-          disabled={!s}
           onClick={() => action("analyze")}
         >
           <Play size={13} />
-          Анализировать
+          Полный · код
         </button>
       </div>
       {notice && (
@@ -1008,7 +1087,8 @@ function ProjectPage({
             {[
               ["overview", "Обзор"],
               ["readme", "README"],
-              ["assessment", "Оценка и доказательства"],
+              ["quick", "Быстрая оценка"],
+              ["assessment", "Полная оценка и доказательства"],
               ["files", "Исходники"],
               ["history", "История"],
             ].map(([key, title]) => (
@@ -1021,6 +1101,7 @@ function ProjectPage({
               </button>
             ))}
           </div>
+          {tab === "quick" && (data.quickReview ? <QuickAssessment review={data.quickReview} tracks={tracks}/> : <Empty title="Быстрой оценки пока нет" detail="Нажмите «Быстрый · README»: исходный код скачивать не требуется." icon={FileText}/>)}
           {tab === "overview" && (
             <div className="detail-grid">
               <section>
@@ -1145,10 +1226,10 @@ function ProjectPage({
                     ))}
                   </select>
                 </label>
-                {a && a.candidates.length > 0 && (
+                {(a?.candidates || data.quickReview?.candidates || []).length > 0 && (
                   <p className="muted">
                     Кандидаты:{" "}
-                    {a.candidates
+                    {(a?.candidates || data.quickReview?.candidates || [])
                       .map((id) => tracks.find((t) => t.id === id)?.name)
                       .join(", ")}
                   </p>
@@ -1185,16 +1266,16 @@ function ProjectPage({
             </div>
           )}
           {tab === "readme" &&
-            (s?.readme ? (
+            (s?.readme || data.readmeSource?.text ? (
               <>
                 <div className="source-caption">
                   <FileText size={15} />
-                  {s.readmePath}
-                  <span>{s.sha.slice(0, 8)}</span>
+                  {s?.readmePath || data.readmeSource?.path}
+                  <span>{(s?.sha || data.readmeSource?.sha)?.slice(0, 8)}</span>
                 </div>
                 <Markdown
-                  text={s.readme}
-                  base={`${p.url}/blob/${s.sha}/${s.readmePath}`}
+                  text={s?.readme || data.readmeSource!.text}
+                  base={`${p.url}/blob/${s?.sha || data.readmeSource?.sha}/${s?.readmePath || data.readmeSource?.path}`}
                 />
               </>
             ) : (
@@ -2176,6 +2257,7 @@ function Settings({
                           sync: "Импорт GitHub",
                           snapshot: "Загрузка снимка",
                           analyze: "AI-анализ",
+                          quick: "Быстрый README + треки",
                           chat: "Вопрос ассистенту",
                         }[j.type]
                       }

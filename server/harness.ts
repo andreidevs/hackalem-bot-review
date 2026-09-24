@@ -194,7 +194,7 @@ export function classifyFailure(text: string) {
     return "auth";
   return "error";
 }
-export function codexArgs(system: string, model: string) {
+export function codexArgs(system: string, model: string, reasoning: "low" | "medium" = "medium") {
   const args = [
     "exec",
     "--ephemeral",
@@ -209,7 +209,7 @@ export function codexArgs(system: string, model: string) {
     "-c",
     'web_search="disabled"',
     "-c",
-    'model_reasoning_effort="medium"',
+    `model_reasoning_effort="${reasoning}"`,
     "-c",
     `developer_instructions=${JSON.stringify(system)}`,
   ];
@@ -242,6 +242,7 @@ export async function oneShot(options: {
   prompt: string;
   signal?: AbortSignal;
   timeout?: number;
+  reasoning?: "low" | "medium";
 }) {
   const bin = findBinary(options.harness);
   if (!bin)
@@ -258,7 +259,7 @@ export async function oneShot(options: {
   try {
     const args =
       options.harness === "codex"
-        ? codexArgs(options.system, model)
+        ? codexArgs(options.system, model, options.reasoning)
         : [
             "-p",
             "--safe-mode",

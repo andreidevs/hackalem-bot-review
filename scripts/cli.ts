@@ -1,4 +1,4 @@
-import { db, enqueue, getProject, now, setSetting } from "../server/db.js";
+import { db, enqueue, getProject, now, setSetting, requestFullAnalysis } from "../server/db.js";
 import { github, syncOrganization } from "../server/github.js";
 import { detectHarness, oneShot } from "../server/harness.js";
 const [command, ...args] = process.argv.slice(2);
@@ -56,8 +56,14 @@ else if (command === "sample") {
       job: enqueue("snapshot", r.id, { priority: -10 }),
     });
   }
-} else if (command === "analyze")
-  console.log({ job: enqueue("analyze", Number(args[0]), { priority: -10 }) });
+} else if (command === "analyze") {
+  setSetting("analysisMode","full");
+  console.log({ job: requestFullAnalysis(Number(args[0])) });
+} else if (command === "quick") {
+  setSetting("analysisMode","quick");
+  setSetting("paused",false);
+  console.log({job:enqueue("quick",args[0] ? Number(args[0]) : null,{priority:-15})});
+}
 else if (command === "pause" || command === "resume") {
   setSetting("paused", command === "pause");
   setSetting("pauseReason", command === "pause" ? "Пауза пользователя" : "");
@@ -81,6 +87,6 @@ else if (command === "smoke")
   );
 else
   console.log(
-    "Команды: sync [limit], sample [repo...], analyze <id>, status, pause, resume, harnesses, smoke",
+    "Команды: sync [limit], sample [repo...], quick [id], analyze <id>, status, pause, resume, harnesses, smoke",
   );
 db.close();

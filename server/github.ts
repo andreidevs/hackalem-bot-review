@@ -315,6 +315,13 @@ export async function snapshotProject(
 ) {
   const p = getProject(id);
   if (!p) throw new Error("Проект не найден");
+  const job = db.prepare("SELECT payload FROM jobs WHERE id=?").get(jobId) as {payload:string} | undefined;
+  const fullRequested = job && JSON.parse(job.payload).mode === "full";
+  const queueAnalysis = () => {
+    const payload = fullRequested ? {mode:"full",priority:-10} : {};
+    enqueue("analyze", id, payload);
+    if (fullRequested) db.prepare("UPDATE jobs SET payload=json_set(payload,'$.mode','full','$.priority',-10) WHERE type='analyze' AND project_id=? AND state='queued'").run(id);
+  };
   progress(jobId, `Чтение ${p.team}`);
   const commit = await github(
     `/repos/${p.fullName}/commits/${encodeURIComponent(p.branch)}`,
@@ -328,6 +335,7 @@ export async function snapshotProject(
   }
   const sha = commit.sha as string;
   if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error("Некорректный commit SHA");
+  db.prepare("UPDATE quick_reviews SET stale=1 WHERE project_id=? AND source_id IN (SELECT id FROM readme_sources WHERE project_id=? AND sha!=?)").run(id,id,sha);
   const existing = db
     .prepare("SELECT id FROM snapshots WHERE project_id=? AND sha=?")
     .get(id, sha) as { id: number } | undefined;
@@ -343,7 +351,7 @@ export async function snapshotProject(
         "SELECT id FROM analyses WHERE project_id=? AND snapshot_id=? AND stale=0",
       )
       .get(id, existing.id);
-    if (!a) enqueue("analyze", id);
+    if (!a) queueAnalysis();
     return { unchanged: true };
   }
   let sources: Awaited<ReturnType<typeof readArchive>>;
@@ -400,7 +408,7 @@ export async function snapshotProject(
     return sid;
   })();
   indexProject(id);
-  enqueue("analyze", id);
+  queueAnalysis();
   return {
     snapshotId,
     files: files.length,
