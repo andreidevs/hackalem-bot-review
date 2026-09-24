@@ -76,9 +76,9 @@ async function lane() {
     // Claim is atomic: better-sqlite3 is synchronous, no await between SELECT and UPDATE.
     const raw = db
       .prepare(
-        `SELECT * FROM jobs WHERE state='queued' AND (project_id IS NULL OR (NOT EXISTS(SELECT 1 FROM jobs r WHERE r.state='running' AND r.project_id=jobs.project_id) AND EXISTS(SELECT 1 FROM projects p WHERE p.id=jobs.project_id AND ${activeSql()}))) AND (type IN ('sync','chat') OR (type='quick' AND ?='quick') OR (type IN ('snapshot','analyze') AND ?='full' AND json_extract(payload,'$.mode')='full')) ORDER BY coalesce(json_extract(payload,'$.priority'),CASE type WHEN 'sync' THEN -30 WHEN 'chat' THEN -20 WHEN 'quick' THEN -15 WHEN 'snapshot' THEN 0 ELSE 10 END),id LIMIT 1`,
+        `SELECT * FROM jobs WHERE state='queued' AND (project_id IS NULL OR (NOT EXISTS(SELECT 1 FROM jobs r WHERE r.state='running' AND r.project_id=jobs.project_id) AND EXISTS(SELECT 1 FROM projects p WHERE p.id=jobs.project_id AND ${activeSql()}))) AND (type IN ('sync','chat','quick') OR (type IN ('snapshot','analyze') AND json_extract(payload,'$.mode')='full')) ORDER BY coalesce(json_extract(payload,'$.priority'),CASE type WHEN 'sync' THEN -30 WHEN 'chat' THEN -20 WHEN 'quick' THEN -15 WHEN 'snapshot' THEN 0 ELSE 10 END),id LIMIT 1`,
       )
-      .get(setting("analysisMode","quick"),setting("analysisMode","quick"));
+      .get();
     if (!raw) {
       await new Promise((r) => setTimeout(r, 700));
       continue;
@@ -89,17 +89,13 @@ async function lane() {
     ).run(now(), job.id);
     const controller = new AbortController();
     active.add(controller);
-    let modeChanged = false;
+    // Quick screening and requested code analyses run side by side; the harness semaphore shares
+    // the AI slots. Only explicitly requested (mode=full) snapshot/analyze jobs are claimed.
     const cancellation = setInterval(() => {
       const row = db
         .prepare("SELECT state FROM jobs WHERE id=?")
         .get(job.id) as { state: string };
       if (row.state === "cancelled") controller.abort();
-      const mode = setting<string>("analysisMode","quick");
-      if ((job.type === "quick" && mode !== "quick") || (["snapshot","analyze"].includes(job.type) && mode !== "full")) {
-        modeChanged = true;
-        controller.abort();
-      }
     }, 500);
     try {
       let result: unknown;
@@ -139,7 +135,7 @@ async function lane() {
         db.prepare(
           "UPDATE jobs SET state='queued',error=?,updated_at=? WHERE id=? AND state='running'",
         ).run(message, now(), job.id);
-      } else if (stopped || modeChanged || (controller.signal.aborted && setting("paused", false)))
+      } else if (stopped || (controller.signal.aborted && setting("paused", false)))
         db.prepare(
           "UPDATE jobs SET state='queued',updated_at=? WHERE id=? AND state='running'",
         ).run(now(), job.id);

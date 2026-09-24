@@ -139,6 +139,13 @@ app.get("/api/tracks", (_req, res) =>
           )
           .get(t.id) as any
       ).n,
+      analyzed: (
+        db
+          .prepare(
+            `SELECT count(*) n FROM projects p WHERE coalesce(manual_track_id,track_id)=? AND ${activeSql()} AND EXISTS(SELECT 1 FROM analyses a WHERE a.project_id=p.id AND a.snapshot_id=p.snapshot_id AND a.stale=0)`,
+          )
+          .get(t.id) as any
+      ).n,
     })),
   ),
 );
@@ -377,6 +384,26 @@ app.post("/api/jobs/:id/cancel", (req, res) => {
   res.json({ ok: true });
 });
 app.get("/api/top", (_req, res) => res.json(topProjects()));
+// Code analysis of every active project in one track, so the track ranking covers all of it.
+app.post("/api/tracks/:id/analyze", (req, res) => {
+  const trackId = idParam(req.params.id);
+  if (!tracks.some((t) => t.id === trackId)) return res.status(404).json({ error: "Трек не найден" });
+  const { maxParts } = z.object({ maxParts: z.number().int().min(1).max(8).default(2) }).parse(req.body ?? {});
+  const ids = (
+    db
+      .prepare(`SELECT id FROM projects p WHERE coalesce(manual_track_id,track_id)=? AND ${activeSql()} AND status!='empty'`)
+      .all(trackId) as { id: number }[]
+  ).map((r) => r.id);
+  const added = db.transaction(() => {
+    setSetting("maxParts", maxParts);
+    setSetting("paused", false);
+    setSetting("pauseReason", "");
+    // Projects already analyzed on their current snapshot are not re-run.
+    const done = db.prepare("SELECT 1 FROM analyses a JOIN projects p ON p.id=a.project_id WHERE a.project_id=? AND a.snapshot_id=p.snapshot_id AND a.stale=0");
+    return ids.filter((id) => !done.get(id)).map((id) => requestFullAnalysis(id)).filter(Boolean).length;
+  })();
+  res.status(202).json({ total: ids.length, added });
+});
 // Second stage for the top: code analysis of a shortlist with a low chunk cap to keep it fast.
 // Runs after the quick screen, since switching to full mode pauses it.
 app.post("/api/shortlist", (req, res) => {
@@ -399,8 +426,10 @@ app.post("/api/shortlist", (req, res) => {
 });
 // Activity window in hours (0 = all). A fresh sync refreshes pushed_at for every repo.
 app.patch("/api/settings/activity", (req, res) => {
-  const { hours } = z.object({ hours: z.union([z.literal(0), z.literal(24), z.literal(48)]) }).parse(req.body);
+  const { hours } = z.object({ hours: z.union([z.literal(0), z.literal(24), z.literal(48), z.literal("hackathon")]) }).parse(req.body);
   setSetting("activityHours", hours);
+  // Sliding windows need fresh push dates; the hackathon window is fixed (repos are archived).
+  // Sync refreshes push dates for sliding windows and fills commit stats for the hackathon window.
   if (hours) enqueue("sync");
   res.json({ ok: true });
 });

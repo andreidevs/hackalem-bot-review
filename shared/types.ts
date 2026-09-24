@@ -22,6 +22,7 @@ export interface Track {
   rubric: Criterion[];
   rubricOrigin: "document" | "analytical";
   count?: number;
+  analyzed?: number;
 }
 export interface Evidence {
   path: string;
@@ -97,6 +98,8 @@ export interface Project {
   error: string | null;
   updatedAt: string;
   pushedAt: string;
+  // Default-branch commits: before 13:00, per hour 13–18 (Astana), after 18:00.
+  commitStats: { before: number; window: number; after: number; hours: number[] } | null;
   syncedAt: string;
   total?: number | null;
   commonTotal?: number | null;
@@ -144,6 +147,9 @@ export interface HarnessInfo {
 }
 export interface QuickReview {
   id: number;
+  // Case named in the README itself, and whether the model chose a different one.
+  declaredTrackId?: number | null;
+  trackMismatch?: boolean;
   projectId: number;
   sourceId: number;
   team: string;

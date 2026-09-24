@@ -294,9 +294,10 @@ export async function analyzeProject(
     classification = result.value as z.infer<typeof schema>;
     save(-1, { ...classification, model: result.model });
   }
+  // An unsure code classification keeps the track from the README screening instead of dropping it.
   const trackId =
     p.manualTrackId ??
-    (classification.confidence >= 0.75 ? classification.trackId : null);
+    (classification.confidence >= 0.75 ? classification.trackId : p.trackId);
   const track = tracks.find((t) => t.id === trackId);
   db.prepare(
     "UPDATE projects SET status='analyzing',track_id=? WHERE id=?",

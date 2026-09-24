@@ -91,8 +91,9 @@ describe("GitHub collection", () => {
             ),
           ),
       );
-    expect(await syncOrganization(0)).toEqual({ count: 101, pages: 2 });
-    expect(mock).toHaveBeenCalledTimes(2);
+    expect(await syncOrganization(0)).toMatchObject({ count: 101, pages: 2 });
+    // Two REST pages plus one commit-stats GraphQL call per 25 projects in the hackathon window.
+    expect(mock.mock.calls.filter(([url]) => !String(url).includes("graphql"))).toHaveLength(2);
     await syncOrganization(0);
     expect((db.prepare("SELECT count(*) n FROM projects").get() as any).n).toBe(
       101,
@@ -872,4 +873,62 @@ it("matches a quote that drops Markdown markup around spaces but not changed wor
   expect(() =>
     validateEvidence([{ path: "README.md", start: 3, end: 3, quote: "Select выбрал" }], [file]),
   ).toThrow("Цитата не найдена");
+});
+
+it("keeps projects pushed during the fixed hackathon window regardless of the current time", async () => {
+  const { isActive } = await import("../server/db.js");
+  db.prepare("UPDATE projects SET pushed_at='2026-09-23T12:40:00Z' WHERE id=2").run();
+  db.prepare("UPDATE projects SET pushed_at='2026-09-22T09:00:00Z' WHERE id=3").run();
+  try {
+    setSetting("activityHours", "hackathon");
+    expect(isActive(2)).toBe(true);
+    expect(isActive(3)).toBe(false);
+  } finally {
+    setSetting("activityHours", 0);
+  }
+});
+
+it("stores hackathon commit rhythm without the org's initial commit", async () => {
+  const { fetchCommitStats } = await import("../server/github.js");
+  db.prepare("UPDATE projects SET commit_stats='{}'").run();
+  db.prepare("UPDATE projects SET commit_stats=NULL,pushed_at='2026-09-23T12:59:00Z' WHERE id=2").run();
+  const count = (n: number) => ({ totalCount: n });
+  const mock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    new Response(JSON.stringify({ data: { r0: { defaultBranchRef: { target: {
+      before: count(3), after: count(0), h0: count(2), h1: count(0), h2: count(4), h3: count(1), h4: count(9),
+    } } } } })),
+  );
+  try {
+    expect(await fetchCommitStats(0)).toBe(1);
+    expect(getProject(2)!.commitStats).toEqual({ before: 2, window: 16, after: 0, hours: [2, 0, 4, 1, 9] });
+  } finally {
+    mock.mockRestore();
+  }
+});
+
+it("reads the case a README names only when it is unambiguous", async () => {
+  const { declaredTrack } = await import("../server/quick.js");
+  expect(declaredTrack("# OpenWind\nCase: Кейс №1 — прогнозирование выработки ВЭС")).toBe(1);
+  expect(declaredTrack("# Проект\nКейс №3 «Граф денег»")).toBe(2);
+  expect(declaredTrack("# Мультикейс\nГраф денег и Voice Router")).toBeNull();
+  expect(declaredTrack("# Просто сервис\nПомогает людям")).toBeNull();
+});
+
+it("queues code analysis for every unanalyzed project of a track", async () => {
+  db.prepare("UPDATE projects SET status='ready',manual_track_id=NULL,track_id=NULL").run();
+  db.prepare("UPDATE projects SET track_id=4 WHERE id IN (2,3)").run();
+  db.prepare("UPDATE jobs SET state='cancelled' WHERE state IN ('queued','running')").run();
+  const res = await fetch(`${base}/api/tracks/4/analyze`, {
+    method: "POST",
+    headers: { "X-HackAlem": "local", "Content-Type": "application/json" },
+    body: "{}",
+  });
+  const body = await res.json();
+  expect(res.status).toBe(202);
+  expect(body.total).toBe(2);
+  const queued = db
+    .prepare("SELECT count(*) n FROM jobs WHERE state='queued' AND project_id IN (2,3) AND json_extract(payload,'$.mode')='full'")
+    .get() as { n: number };
+  expect(queued.n).toBe(body.added);
+  expect(setting("maxParts", 8)).toBe(2);
 });

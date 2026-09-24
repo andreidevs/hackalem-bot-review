@@ -20,6 +20,28 @@ verifiable (0–25): по одному шагу за каждое: назван�
 value (0–20): 0 — польза не названа; 10 — польза заявлена общими словами; 20 — измеримый эффект для пользователя с обоснованием, откуда он взялся.
 originality (0–20): 0 — типовое решение/обёртка над чат-ботом; 10 — есть собственный элемент; 20 — явное и обоснованное отличие от существующих подходов.
 Высокий балл без цитаты, подтверждающей конкретный факт, недопустим. Длинный README без этих фактов должен получать средние и низкие баллы.`;
+// Case names teams write in their README ("Кейс №3 «Граф денег»"). Only distinctive phrases:
+// shared partners (Самрук-Казына, Halyk, ekt.kz) appear in two tracks and are left out.
+const CASE_ALIASES: Record<number, RegExp> = {
+  1: /выработк\S* ВЭС|ветров\S* электростанц|wind[- ]farm/i,
+  2: /граф денег|money graph/i,
+  3: /career quest/i,
+  4: /beeline|билайн/i,
+  5: /заказ\S* поставщик/i,
+  6: /подбор\S* подрядчик|firebird/i,
+  7: /ai sana|challenge hub/i,
+  8: /хаттама|автопротокол/i,
+  9: /voice router/i,
+  10: /ассистент ekt|консультант\S* по каталогу/i,
+  11: /оргструктур/i,
+  12: /аким на 5 часов/i,
+};
+// The case a README names in its opening lines, when exactly one case matches.
+export function declaredTrack(text: string): number | null {
+  const head = text.split("\n").slice(0, 60).join("\n");
+  const hits = Object.entries(CASE_ALIASES).filter(([, re]) => re.test(head)).map(([id]) => Number(id));
+  return hits.length === 1 ? hits[0] : null;
+}
 const trackBrief = tracks.map(t => ({id:t.id,name:t.name,case:t.caseName,key:t.requirements.filter(r=>r.kind==="required").slice(0,3).map(r=>r.text.slice(0,140))}));
 const specHash = createHash("sha256").update(JSON.stringify(tracks.map(t => t.hash))).digest("hex");
 db.prepare("UPDATE quick_reviews SET stale=1 WHERE json_extract(data,'$.specHash')!=? OR json_extract(data,'$.methodVersion')!=?").run(specHash,QUICK_VERSION);
@@ -164,7 +186,9 @@ sourceData=${JSON.stringify(sources.map(s => {
         const s = sources.find(s=>s.project_id===r.projectId)!;
         const f = files.get(r.projectId)!;
         const p = getProject(r.projectId)!;
-        const data = {...r, trackId:p.manualTrackId ?? (r.confidence >= 0.75 ? r.trackId : null), candidates:[...new Set([...r.candidates,...(r.trackId ? [r.trackId] : [])])].slice(0,3),total:r.scores.reduce((n,s)=>n+s.points,0), model:out.model,harness:out.harness,modelKey,methodVersion:QUICK_VERSION,specHash,manualTrackId:p.manualTrackId,truncated:f.text.length<s.text.length,reviewedChars:f.text.length};
+        // The case named in the README decides when the model is unsure; a disagreement is flagged.
+        const declared = declaredTrack(s.text);
+        const data = {...r, trackId:p.manualTrackId ?? (r.confidence >= 0.75 ? r.trackId : declared), declaredTrackId:declared, trackMismatch:!!(declared && r.trackId && r.confidence >= 0.75 && declared !== r.trackId), candidates:[...new Set([...r.candidates,...(r.trackId ? [r.trackId] : [])])].slice(0,3),total:r.scores.reduce((n,s)=>n+s.points,0), model:out.model,harness:out.harness,modelKey,methodVersion:QUICK_VERSION,specHash,manualTrackId:p.manualTrackId,truncated:f.text.length<s.text.length,reviewedChars:f.text.length};
         db.prepare("INSERT INTO quick_reviews(project_id,source_id,track_id,total,data,created_at) VALUES(?,?,?,?,?,?)").run(p.id,s.id,data.trackId,data.total,JSON.stringify(data),now());
         db.prepare("UPDATE projects SET track_id=?,summary=? WHERE id=? AND NOT EXISTS(SELECT 1 FROM analyses WHERE project_id=? AND stale=0)").run(data.trackId,data.summary,p.id,p.id);
         indexProject(p.id);
@@ -246,7 +270,7 @@ export async function quickScan(jobId: number, signal: AbortSignal) {
   const lane = async () => {
     while (next < ids.length && !yielded) {
       signal.throwIfAborted();
-      if (setting("paused",false) || setting("analysisMode","quick") !== "quick") { yielded = true; return; }
+      if (setting("paused",false)) { yielded = true; return; }
       const offset = next;
       next += BATCH_SIZE;
       await processBatch(offset);

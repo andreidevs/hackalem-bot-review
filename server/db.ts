@@ -41,11 +41,22 @@ if (
   )
 )
   db.exec("ALTER TABLE projects ADD COLUMN pushed_at TEXT");
+if (
+  !(db.prepare("PRAGMA table_info(projects)").all() as { name: string }[]).some(
+    (c) => c.name === "commit_stats",
+  )
+)
+  db.exec("ALTER TABLE projects ADD COLUMN commit_stats TEXT");
 export const now = () => new Date().toISOString();
 // Activity window: projects without a push in the last N hours are neither processed nor listed.
 // pushed_at comes from the GitHub repo listing; updated_at is the fallback until the next sync.
+// HackAlem AI 2026 development window: 23.09 13:00–18:00 Astana (UTC+5); repos were archived after it.
+export const HACKATHON_START = "2026-09-23T08:00:00Z";
+export const HACKATHON_END = "2026-09-23T13:00:00Z";
 export function activeSql(alias = "p") {
-  const hours = setting("activityHours", 0);
+  const hours = setting<number | "hackathon">("activityHours", 0);
+  // Fixed window: a push during or after the start means the team committed during the hackathon.
+  if (hours === "hackathon") return `coalesce(${alias}.pushed_at,${alias}.updated_at) >= '${HACKATHON_START}'`;
   if (!hours) return "1";
   const cutoff = new Date(Date.now() - hours * 3600000).toISOString().replace(/\.\d{3}Z$/, "Z");
   return `coalesce(${alias}.pushed_at,${alias}.updated_at) >= '${cutoff}'`;
@@ -104,6 +115,7 @@ export function project(row: any): Project {
     error: row.error,
     updatedAt: row.updated_at,
     pushedAt: row.pushed_at ?? row.updated_at,
+    commitStats: row.commit_stats ? JSON.parse(row.commit_stats) : null,
     syncedAt: row.synced_at,
     ...(row.analysis_id
       ? {

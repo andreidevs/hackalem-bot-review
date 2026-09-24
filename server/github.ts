@@ -4,7 +4,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 import tar from "tar-stream";
-import { db, enqueue, getProject, indexProject, now, progress } from "./db.js";
+import { db, enqueue, getProject, indexProject, now, progress, HACKATHON_START, HACKATHON_END } from "./db.js";
 import type { SourceFile, Snapshot } from "../shared/types.js";
 const exec = promisify(execFile);
 export class PauseError extends Error {
@@ -21,18 +21,21 @@ async function githubToken() {
     .then((r) => r.stdout.trim())
     .catch(() => process.env.GITHUB_TOKEN || ""));
 }
-export async function github(path: string, signal?: AbortSignal) {
+// Shared GitHub request loop: auth, rate-limit pauses, retries on network errors and 5xx.
+async function githubFetch(url: string, init: RequestInit, signal?: AbortSignal) {
   signal?.throwIfAborted();
   const token = await githubToken();
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "User-Agent": "HackAlem-local-catalog",
+    ...(init.headers as Record<string, string>),
   };
   if (token) headers.Authorization = `Bearer ${token}`;
   for (let attempt = 0; attempt < 3; attempt++) {
     let response: Response;
     try {
-      response = await fetch(`https://api.github.com${path}`, {
+      response = await fetch(url, {
+        ...init,
         headers,
         signal: signal
           ? AbortSignal.any([signal, AbortSignal.timeout(30000)])
@@ -65,12 +68,67 @@ export async function github(path: string, signal?: AbortSignal) {
       await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
       continue;
     }
-    if (response.status === 409) return null;
-    if (!response.ok)
-      throw new Error(`GitHub: HTTP ${response.status} для ${path}`);
-    return response.json();
+    return response;
   }
   throw new Error("GitHub временно недоступен");
+}
+export async function github(path: string, signal?: AbortSignal) {
+  const response = await githubFetch(`https://api.github.com${path}`, {}, signal);
+  if (response.status === 409) return null;
+  if (!response.ok)
+    throw new Error(`GitHub: HTTP ${response.status} для ${path}`);
+  return response.json();
+}
+export async function githubGraphql(query: string, signal?: AbortSignal) {
+  const response = await githubFetch(
+    "https://api.github.com/graphql",
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query }) },
+    signal,
+  );
+  if (!response.ok) throw new Error(`GitHub GraphQL: HTTP ${response.status}`);
+  const body = (await response.json()) as { data?: any; errors?: { message: string }[] };
+  if (!body.data) throw new Error(`GitHub GraphQL: ${body.errors?.[0]?.message || "пустой ответ"}`);
+  return body.data;
+}
+// Commit rhythm during the hackathon (default branch): commits before the start, in each of the
+// five hours, and after the end. The org's auto-created first commit is not counted as team work.
+// Repos are archived, so the numbers are fetched once per project.
+export async function fetchCommitStats(jobId: number, signal?: AbortSignal) {
+  const pending = db
+    .prepare(`SELECT id,name FROM projects p WHERE commit_stats IS NULL AND coalesce(pushed_at,updated_at)>=?`)
+    .all(HACKATHON_START) as { id: number; name: string }[];
+  const start = Date.parse(HACKATHON_START);
+  const hour = (h: number) => new Date(start + h * 3600000).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const history = (alias: string, range: string) => `${alias}: history(${range}) { totalCount }`;
+  for (let i = 0; i < pending.length; i += 25) {
+    const batch = pending.slice(i, i + 25);
+    const query = `query {${batch
+      .map(
+        (p, k) => `r${k}: repository(owner: "BAITC-Hacks", name: ${JSON.stringify(p.name)}) { defaultBranchRef { target { ... on Commit {
+          ${history("before", `until: "${HACKATHON_START}"`)}
+          ${history("after", `since: "${HACKATHON_END}"`)}
+          ${[0, 1, 2, 3, 4].map((h) => history(`h${h}`, `since: "${hour(h)}", until: "${hour(h + 1)}"`)).join("\n")}
+        } } } }`,
+      )
+      .join("\n")}}`;
+    const data = await githubGraphql(query, signal);
+    db.transaction(() => {
+      batch.forEach((p, k) => {
+        const c = data[`r${k}`]?.defaultBranchRef?.target;
+        if (!c) return;
+        const hours = [0, 1, 2, 3, 4].map((h) => c[`h${h}`].totalCount as number);
+        const stats = {
+          before: Math.max(0, c.before.totalCount - 1),
+          window: hours.reduce((a, b) => a + b, 0),
+          after: c.after.totalCount,
+          hours,
+        };
+        db.prepare("UPDATE projects SET commit_stats=? WHERE id=?").run(JSON.stringify(stats), p.id);
+      });
+    })();
+    progress(jobId, `Статистика коммитов · ${Math.min(i + 25, pending.length)}/${pending.length}`);
+  }
+  return pending.length;
 }
 export async function syncOrganization(
   jobId: number,
@@ -118,7 +176,15 @@ export async function syncOrganization(
     if (rows.length < 100 || (limit && count >= limit)) break;
     page++;
   }
-  return { count, pages: page };
+  // Commit stats are auxiliary: a GraphQL failure must not fail the repository import.
+  let commitStats: number | string = 0;
+  try {
+    commitStats = await fetchCommitStats(jobId, signal);
+  } catch (error) {
+    if (signal?.aborted || error instanceof PauseError) throw error;
+    commitStats = (error as Error).message;
+  }
+  return { count, pages: page, commitStats };
 }
 export function skipReason(path: string, size: number): string | null {
   if (

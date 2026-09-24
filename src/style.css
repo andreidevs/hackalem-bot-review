@@ -1927,3 +1927,20 @@ details summary {
 .activity-filter small {
   font-size: 12px;
 }
+.commit-flags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  vertical-align: middle;
+}
+.track-analysis {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+@media (max-width: 720px) {
+  .track-analysis {
+    align-items: flex-start;
+  }
+}

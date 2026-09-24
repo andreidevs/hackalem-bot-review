@@ -220,7 +220,7 @@ function Markdown({ text, base }: { text: string; base?: string }) {
 type Stats = {
   total: number;
   allProjects: number;
-  activityHours: number;
+  activityHours: number | "hackathon";
   quickReviewed: number;
   analysisMode: "quick" | "full";
   snapshots: number;
@@ -520,9 +520,48 @@ function App() {
     </div>
   );
 }
+// Runs code analysis for every active project of a track and links to its ranking by score.
+function TrackAnalysis({ track }: { track: Track }) {
+  const [notice, setNotice] = useState("");
+  const all = track.count || 0,
+    done = track.analyzed || 0;
+  return (
+    <div className="track-analysis">
+      <div className="button-group">
+        <button
+          className="button primary"
+          disabled={!all || done >= all}
+          onClick={async () => {
+            if (
+              !confirm(
+                `Проверить код всех ${all} проектов трека «${track.name}»? Уже проверенные (${done}) не повторяются. Облегчённый режим: до 2 частей кода на проект.`,
+              )
+            )
+              return;
+            try {
+              const r = await api<{ total: number; added: number }>(`/tracks/${track.id}/analyze`, {});
+              setNotice(`В очереди на проверку кода: ${r.added} из ${r.total}`);
+            } catch (e) {
+              setNotice((e as Error).message);
+            }
+          }}
+        >
+          <Play size={15} /> Полный анализ трека
+        </button>
+        <Link className="button" to={`/rankings?track=${track.id}`}>
+          <BarChart3 size={15} /> Рейтинг трека
+        </Link>
+      </div>
+      <small className="muted">
+        Код проверен: {done} из {all}
+        {notice && ` · ${notice}`}
+      </small>
+    </div>
+  );
+}
 // Global activity window: projects without a recent push are hidden and not processed.
 function ActivityFilter({ stats }: { stats: Stats | null }) {
-  const [value, setValue] = useState<number | null>(null);
+  const [value, setValue] = useState<number | "hackathon" | null>(null);
   const hours = value ?? stats?.activityHours ?? 0;
   const hidden = stats ? stats.allProjects - stats.total : 0;
   return (
@@ -531,7 +570,7 @@ function ActivityFilter({ stats }: { stats: Stats | null }) {
         aria-label="Последний коммит"
         value={hours}
         onChange={async (e) => {
-          const next = Number(e.target.value);
+          const next = e.target.value === "hackathon" ? "hackathon" : Number(e.target.value);
           setValue(next);
           try {
             await api("/settings/activity", { hours: next }, "PATCH");
@@ -541,10 +580,11 @@ function ActivityFilter({ stats }: { stats: Stats | null }) {
         }}
       >
         <option value={0}>Все проекты</option>
+        <option value="hackathon">Коммиты во время хакатона (23.09, 13–18)</option>
         <option value={24}>Коммит за последние 24 ч</option>
         <option value={48}>Коммит за последние 48 ч</option>
       </select>
-      {hours > 0 && hidden > 0 && (
+      {hours !== 0 && hidden > 0 && (
         <small className="muted">Скрыто неактивных: {hidden}</small>
       )}
     </label>
@@ -628,15 +668,19 @@ function Catalog({
               : "Исследуйте решения, изучайте код и находите сильные проекты."}
           </p>
         </div>
-        <a
-          className="text-link"
-          href="https://github.com/BAITC-Hacks"
-          target="_blank"
-          rel="noreferrer"
-        >
-          Организация на GitHub
-          <ArrowUpRight size={16} />
-        </a>
+        {track ? (
+          <TrackAnalysis track={track} />
+        ) : (
+          <a
+            className="text-link"
+            href="https://github.com/BAITC-Hacks"
+            target="_blank"
+            rel="noreferrer"
+          >
+            Организация на GitHub
+            <ArrowUpRight size={16} />
+          </a>
+        )}
       </div>
       <div className="overview">
         <div>
@@ -954,7 +998,7 @@ function QuickRankingPage({tracks,stats,params,revision}:{tracks:Track[];stats:S
     <div className="filters"><ActivityFilter stats={stats} /><input aria-label="Поиск в быстром рейтинге" placeholder="Команда или идея…" value={params.get("q") || ""} onChange={e=>change("q",e.target.value)}/><select aria-label="Трек быстрого рейтинга" value={params.get("track") || ""} onChange={e=>change("track",e.target.value)}><option value="">Все 12 треков</option>{tracks.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><Link to="/rankings" className="text-link">Рейтинг по исходному коду <ArrowRight size={14}/></Link></div>
     <div className="quick-actions"><button className="button" disabled={!data?.items.length} onClick={()=>setChosen(data!.items.slice(0,10).map(r=>r.projectId))}>Выбрать первые 10 на странице</button><button className="text-button" onClick={()=>setChosen([])}>Сбросить</button><button className="button primary" disabled={!chosen.length || busy} onClick={()=>run(true)}><Code2 size={15}/>Проверить код выбранных ({chosen.length})</button></div>
     {notice && <div role="status" className="notice">{notice}</div>}<ErrorBox message={error}/>
-    {!data ? <Loading/> : !data.items.length ? <Empty title="Здесь появится отбор по README" detail="Запустите быстрый анализ. Результаты и треки будут появляться по мере обработки пакетов." icon={FileText}/> : <div className="quick-list">{data.items.map(r=><article className="quick-row" key={r.id}><input type="checkbox" aria-label={`Проверить код ${r.team}`} checked={chosen.includes(r.projectId)} disabled={chosen.length>=50 && !chosen.includes(r.projectId)} onChange={()=>setChosen(a=>a.includes(r.projectId)?a.filter(id=>id!==r.projectId):[...a,r.projectId])}/><span className="rank">{r.rank}</span><div><Link to={`/project/${r.projectId}?tab=quick`}><h3>{r.team}</h3></Link><p>{r.summary}</p><span className="badge">{tracks.find(t=>t.id===r.trackId)?.name || "Требует классификации"}</span>{!r.trackId && r.candidates.length>0 && <small> Возможные треки: {r.candidates.map(id=>tracks.find(t=>t.id===id)?.name).join(", ")}</small>}<p className="muted">{r.risks[0]}</p><Link className="text-link" to={`/readme/${r.sourceId}`}>README · {r.sha.slice(0,8)} <ArrowUpRight size={13}/></Link></div><div className="ranking-score">{r.total}<small>/100 · описание</small></div></article>)}</div>}
+    {!data ? <Loading/> : !data.items.length ? <Empty title="Здесь появится отбор по README" detail="Запустите быстрый анализ. Результаты и треки будут появляться по мере обработки пакетов." icon={FileText}/> : <div className="quick-list">{data.items.map(r=><article className="quick-row" key={r.id}><input type="checkbox" aria-label={`Проверить код ${r.team}`} checked={chosen.includes(r.projectId)} disabled={chosen.length>=50 && !chosen.includes(r.projectId)} onChange={()=>setChosen(a=>a.includes(r.projectId)?a.filter(id=>id!==r.projectId):[...a,r.projectId])}/><span className="rank">{r.rank}</span><div><Link to={`/project/${r.projectId}?tab=quick`}><h3>{r.team}</h3></Link><p>{r.summary}</p><span className="badge">{tracks.find(t=>t.id===r.trackId)?.name || "Требует классификации"}</span>{r.trackMismatch && <span className="badge amber" title="В README назван другой кейс; трек стоит проверить">В README: {tracks.find(t=>t.id===r.declaredTrackId)?.name}</span>}{!r.trackId && r.candidates.length>0 && <small> Возможные треки: {r.candidates.map(id=>tracks.find(t=>t.id===id)?.name).join(", ")}</small>}<p className="muted">{r.risks[0]}</p><Link className="text-link" to={`/readme/${r.sourceId}`}>README · {r.sha.slice(0,8)} <ArrowUpRight size={13}/></Link></div><div className="ranking-score">{r.total}<small>/100 · описание</small></div></article>)}</div>}
     {data && data.total>40 && <div className="pagination"><button className="button" disabled={data.page<=1} onClick={()=>change("page",String(data.page-1))}>Назад</button><span>{data.page} / {Math.ceil(data.total/40)}</span><button className="button" disabled={data.page*40>=data.total} onClick={()=>change("page",String(data.page+1))}>Далее</button></div>}
   </>;
 }
@@ -962,6 +1006,7 @@ function QuickAssessment({review:r,tracks}:{review:QuickReview;tracks:Track[]}) 
   return <>
     <div className="notice">Быстрый анализ README · код не изучался · {r.total}/100 за описание{r.stale && <strong>Оценка устарела</strong>}</div>
     <h2>{tracks.find(t=>t.id===r.trackId)?.name || "Требует классификации"}</h2>
+    {r.trackMismatch && <p className="notice amber">В README назван кейс «{tracks.find(t=>t.id===r.declaredTrackId)?.name}», а модель выбрала другой трек. Проверьте трек вручную.</p>}
     {!r.trackId && <p>Возможные треки: {r.candidates.map(id=>tracks.find(t=>t.id===id)?.name).join(", ") || "Недостаточно данных"}</p>}
     <p>{r.summary}</p><div className="two-columns"><section><h3>Почему стоит проверить</h3><ul>{r.strengths.map((s,i)=><li key={i}>{s}</li>)}</ul></section><section><h3>Что проверить по коду</h3><ul>{r.risks.map((s,i)=><li key={i}>{s}</li>)}</ul></section></div>
     <div className="score-list">{r.scores.map(s=><section key={s.id}><h3>{QUICK_RUBRIC.find(c=>c.id===s.id)?.title} · {s.points}/{QUICK_RUBRIC.find(c=>c.id===s.id)?.max}</h3><p>{s.rationale}</p><div className="evidence-links">{s.evidence.map((e,i)=><Link key={i} to={`/readme/${r.sourceId}?line=${e.start}`} title={e.quote}>{e.path}:{e.start}–{e.end}</Link>)}</div></section>)}</div>
@@ -1078,6 +1123,7 @@ function ProjectPage({
           </a>
         ))}
         <Badge status={a?.stale ? "stale" : p.status} />
+        <CommitFlags stats={p.commitStats} />
         <span>
           <GitBranch size={14} />
           {p.branch} · {p.sha?.slice(0, 8) || "Нет снимка"}
@@ -1579,6 +1625,37 @@ function SourceViewer({
     </div>
   );
 }
+// Commit rhythm flags: signals for the expert to check, not points. Hours are 13–18 Astana.
+function CommitFlags({ stats }: { stats: Project["commitStats"] }) {
+  if (!stats) return null;
+  const active = stats.hours.filter((n) => n > 0).length;
+  const lastHour = stats.window ? stats.hours[4] / stats.window : 0;
+  return (
+    <span className="commit-flags">
+      <span
+        className="badge"
+        title={`Коммиты по часам 13–18: ${stats.hours.join(" / ")}`}
+      >
+        {stats.window} коммитов · {active}/5 ч
+      </span>
+      {stats.before > 0 && (
+        <span className="badge amber" title="Коммиты команды раньше 13:00 23.09: код мог быть написан до старта">
+          До старта: {stats.before}
+        </span>
+      )}
+      {stats.after > 0 && (
+        <span className="badge amber" title="Коммиты после 18:00 23.09, после окончания разработки">
+          После 18:00: {stats.after}
+        </span>
+      )}
+      {stats.window >= 5 && lastHour >= 0.8 && (
+        <span className="badge amber" title="80%+ коммитов в последний час: стоит проверить, как шла работа">
+          Почти всё в последний час
+        </span>
+      )}
+    </span>
+  );
+}
 type Ranked = Project & { score: number; rank: number };
 function RankingRow({ p, tracks }: { p: Ranked; tracks: Track[] }) {
   return (
@@ -1589,7 +1666,8 @@ function RankingRow({ p, tracks }: { p: Ranked; tracks: Track[] }) {
         <p>{p.summary}</p>
         <small>
           {tracks.find((t) => t.id === p.trackId)?.name || "Трек не определён"}
-        </small>
+        </small>{" "}
+        <CommitFlags stats={p.commitStats} />
       </div>
       <span className="ranking-score">
         {p.score}
