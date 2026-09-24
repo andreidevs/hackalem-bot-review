@@ -1,0 +1,19 @@
+name: hackalem
+services:
+  hackalem:
+    build: .
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "127.0.0.1:4310:4310"
+    volumes:
+      - catalog-data:/app/data
+      - cli-home:/home/node
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  catalog-data:
+  cli-home:
