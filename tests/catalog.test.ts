@@ -859,3 +859,17 @@ it("recognizes the organization template README as having no description", async
   expect(isTemplateReadme("# hack-1-geeks\nHackathon team repository for Geeks\n")).toBe(true);
   expect(isTemplateReadme("# Хаттама\n\nИИ-секретарь совещаний: протокол с поручениями и сроками.")).toBe(false);
 });
+
+it("extracts the first JSON object when a model adds text around it", () => {
+  expect(jsonAnswer('Вот ответ: {"a":"}{","b":[1]} спасибо')).toEqual({ a: "}{", b: [1] });
+});
+
+it("matches a quote that drops Markdown markup around spaces but not changed words", () => {
+  const file = { path: "README.md", text: "# T\n`data/x.csv` — точная копия\n**Select** выбирает", bytes: 1, lines: 3 };
+  const e = { path: "README.md", start: 2, end: 2, quote: "data/x.csv — точная копия" };
+  validateEvidence([e], [file]);
+  expect(e.quote).toBe("data/x.csv` — точная копия");
+  expect(() =>
+    validateEvidence([{ path: "README.md", start: 3, end: 3, quote: "Select выбрал" }], [file]),
+  ).toThrow("Цитата не найдена");
+});

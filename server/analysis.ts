@@ -90,7 +90,9 @@ export function validateEvidence(evidence: Evidence[], files: SourceFile[]) {
         .trim()
         .split(/\s+/)
         .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-        .join("\\s+");
+        // Markdown markup (**bold**, `code`, _em_, ~~strike~~) may sit next to the spaces;
+        // the words themselves must still match exactly.
+        .join("[*_`~]*\\s+[*_`~]*");
       const match = pattern ? fragment.match(new RegExp(pattern)) : null;
       const moved = !match && pattern ? relocate(f.text, new RegExp(pattern, "g"), e.start) : null;
       if (match) e.quote = match[0];

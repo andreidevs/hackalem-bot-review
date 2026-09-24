@@ -384,5 +384,23 @@ export function jsonAnswer(text: string): unknown {
     .trim()
     .replace(/^```(?:json)?\s*/, "")
     .replace(/\s*```$/, "");
-  return JSON.parse(stripped);
+  try {
+    return JSON.parse(stripped);
+  } catch (error) {
+    // Models sometimes add prose before or after the JSON: take the first complete object.
+    const start = stripped.indexOf("{");
+    if (start < 0) throw error;
+    let depth = 0,
+      inString = false;
+    for (let i = start; i < stripped.length; i++) {
+      const c = stripped[i];
+      if (inString) {
+        if (c === "\\") i++;
+        else if (c === '"') inString = false;
+      } else if (c === '"') inString = true;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) return JSON.parse(stripped.slice(start, i + 1));
+    }
+    throw error;
+  }
 }

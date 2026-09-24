@@ -164,11 +164,13 @@ export interface QuickReview {
   truncated: boolean;
   reviewedChars: number;
 }
+// Points are tied to checkable facts in the README, not to its length or polish.
 export const QUICK_RUBRIC: Criterion[] = [
-  { id: "clarity", title: "Ясность задачи и решения", max: 30 },
-  { id: "value", title: "Заявленная польза", max: 30 },
-  { id: "originality", title: "Отличия идеи", max: 20 },
-  { id: "detail", title: "Конкретика описания", max: 20 },
+  { id: "problem", title: "Задача и пользователь", max: 10 },
+  { id: "case", title: "Покрытие требований кейса", max: 25 },
+  { id: "verifiable", title: "Проверяемость", max: 25 },
+  { id: "value", title: "Польза и эффект", max: 20 },
+  { id: "originality", title: "Отличие от аналогов", max: 20 },
 ];
 export const VERDICTS: Record<Verdict, string> = {
   code: "Подтверждено кодом",

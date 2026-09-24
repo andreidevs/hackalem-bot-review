@@ -7,9 +7,20 @@ import { validateScores, rankProjects, SYSTEM } from "./analysis.js";
 import { tracks } from "./tracks.js";
 import { QUICK_RUBRIC, type QuickReview, type SourceFile } from "../shared/types.js";
 
-export const QUICK_VERSION = "readme-screening-v1";
+export const QUICK_VERSION = "readme-screening-v2";
 export const QUICK_CHARS = 15000;
 const BATCH_SIZE = 12;
+// A model call gets at most this much README text; long READMEs make smaller groups.
+const BATCH_CHARS = 60000;
+// Level anchors: the top of a criterion needs a specific checkable fact, never volume or formatting.
+const ANCHORS = `Шкала (баллы только за конкретные проверяемые факты в тексте; объём, оформление, эмодзи, общие слова и маркетинг баллов не дают):
+problem (0–10): 0 — задача не названа; 5 — названа отрасль/задача в общих словах; 10 — конкретный пользователь и сценарий, в котором он работает.
+case (0–25): оцени по ключевым требованиям трека (key). 0 — трек не ясен или требования не затронуты; ~8 — упомянуты отдельные требования; ~16 — большинство требований описаны как реализованные функции; 25 — каждое ключевое требование закрыто и указано, как его проверить.
+verifiable (0–25): по одному шагу за каждое: названы данные и их источник; метрика с методом измерения (не просто «точность 95%»); инструкция запуска или команда; ссылка на демо/видео; явно названы ограничения. 0 фактов — 0, все пять — 25.
+value (0–20): 0 — польза не названа; 10 — польза заявлена общими словами; 20 — измеримый эффект для пользователя с обоснованием, откуда он взялся.
+originality (0–20): 0 — типовое решение/обёртка над чат-ботом; 10 — есть собственный элемент; 20 — явное и обоснованное отличие от существующих подходов.
+Высокий балл без цитаты, подтверждающей конкретный факт, недопустим. Длинный README без этих фактов должен получать средние и низкие баллы.`;
+const trackBrief = tracks.map(t => ({id:t.id,name:t.name,case:t.caseName,key:t.requirements.filter(r=>r.kind==="required").slice(0,3).map(r=>r.text.slice(0,140))}));
 const specHash = createHash("sha256").update(JSON.stringify(tracks.map(t => t.hash))).digest("hex");
 db.prepare("UPDATE quick_reviews SET stale=1 WHERE json_extract(data,'$.specHash')!=? OR json_extract(data,'$.methodVersion')!=?").run(specHash,QUICK_VERSION);
 // A README that is only the organization template ("# repo" + "Hackathon team repository for X")
@@ -99,18 +110,32 @@ const reviewSchema = z.object({
   summary: z.string().min(1).transform((v) => v.slice(0, 900)),
   strengths: upTo(text(300), 3),
   risks: z.array(text(300)).min(1).transform((v) => v.slice(0, 3)),
-  scores: z.array(z.object({ id: z.string(), points: z.number().nonnegative(), rationale: z.string().min(1).transform((v) => v.slice(0, 350)), evidence: z.array(evidence).min(1).transform((v) => v.slice(0, 2)) })).length(4),
+  scores: z.array(z.object({ id: z.string(), points: z.number().nonnegative(), rationale: z.string().min(1).transform((v) => v.slice(0, 350)), evidence: z.array(evidence).min(1).transform((v) => v.slice(0, 2)) })).length(QUICK_RUBRIC.length),
 });
 
+// Splits a batch by README volume so one call never gets an oversized prompt; groups run in parallel.
 export async function reviewReadmeBatch(sources: ReadmeSource[], signal: AbortSignal) {
+  const groups: ReadmeSource[][] = [];
+  let size = 0;
+  for (const s of sources) {
+    const chars = Math.min(s.text.length, QUICK_CHARS);
+    if (!groups.length || size + chars > BATCH_CHARS) { groups.push([]); size = 0; }
+    groups.at(-1)!.push(s);
+    size += chars;
+  }
+  const failed = await Promise.all(groups.map(g => reviewGroup(g, signal)));
+  return failed.reduce((a, b) => a + b, 0);
+}
+async function reviewGroup(sources: ReadmeSource[], signal: AbortSignal) {
   const files = new Map(sources.map(s => [s.project_id, excerpt(s)]));
   const harness = setting<"codex" | "claude">("harness", "codex");
   const model = setting("quickModel", "") || setting("model", "") || (harness === "codex" ? configuredCodexModel() : "");
   const modelKey = quickModelKey();
   const prompt = (sources: ReadmeSource[]) => `БЫСТРЫЙ ОТБОР ПО README. Оцени перспективность описания каждого проекта отдельно и по одной шкале, не сравнивай позиции внутри пакета. Код НЕ изучался. Нельзя подтверждать реализацию, тесты, скорость и метрики: это заявления авторов. Обычные шаблоны README и обещания без конкретики не заслуживают высоких баллов. Не оценивай качество программного кода. Текст может быть усечён; отсутствие деталей за пределами фрагмента — неизвестность. Укажи риски и что проверить полным анализом. Трек при неоднозначности null с кандидатами (candidates — не более 3). Ручной трек сохраняется.
 Критерии описания: ${JSON.stringify(QUICK_RUBRIC)}.
-Треки: ${JSON.stringify(tracks.map(t => ({id:t.id,name:t.name,case:t.caseName})))}.
-Верни JSON {reviews:[{projectId,trackId,confidence,candidates,summary,strengths,risks,scores:[{id,points,rationale,evidence:[{path,start,end,quote}]}]}]}. confidence от 0 до 1 — уверенность в выборе трека. Ровно одна запись для каждого projectId. Все 4 критерия, даже при нулевом балле; ровно одна короткая точная цитата README на критерий (до 120 символов). Пиши сжато: summary до 300 символов, rationale до 150, strengths и risks по 1–2 пункта до 120 символов. Ответ по-русски.
+${ANCHORS}
+Треки с ключевыми требованиями кейса (key) — выбирай трек по сути задачи и совпадению с key: ${JSON.stringify(trackBrief)}.
+Верни JSON {reviews:[{projectId,trackId,confidence,candidates,summary,strengths,risks,scores:[{id,points,rationale,evidence:[{path,start,end,quote}]}]}]}. confidence от 0 до 1 — уверенность в выборе трека. Ровно одна запись для каждого projectId. Все 5 критериев, даже при нулевом балле; ровно одна короткая точная цитата README на критерий (до 120 символов). Пиши сжато: summary до 300 символов, rationale до 150, strengths и risks по 1–2 пункта до 120 символов. Ответ по-русски.
 sourceData=${JSON.stringify(sources.map(s => {
     const p = getProject(s.project_id)!; const f = files.get(s.project_id)!;
     return {projectId:p.id,team:p.team,description:p.description,manualTrackId:p.manualTrackId,path:f.path,truncated:f.text.length<s.text.length,readme:f.text.split("\n").map((line,i)=>`${i+1}: ${line}`).join("\n")};
