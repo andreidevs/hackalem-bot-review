@@ -15,6 +15,7 @@ import {
   parseJob,
   setting,
   setSetting,
+  activeSql,
 } from "./db.js";
 import { tracks, commonRubric, METHOD_VERSION } from "./tracks.js";
 import {
@@ -25,7 +26,7 @@ import {
   demoLinks,
   coverageReport,
 } from "./catalog.js";
-import { detectHarness } from "./harness.js";
+import { detectHarness, modelOptions } from "./harness.js";
 import { latestQuickReview, quickRankings } from "./quick.js";
 export const app = express();
 app.disable("x-powered-by");
@@ -71,9 +72,11 @@ const idsSchema = z
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 function stats() {
   return {
-    total: (db.prepare("SELECT count(*) n FROM projects").get() as any).n,
+    total: (db.prepare(`SELECT count(*) n FROM projects p WHERE ${activeSql()}`).get() as any).n,
+    allProjects: (db.prepare("SELECT count(*) n FROM projects").get() as any).n,
+    activityHours: setting("activityHours", 0),
     analysisMode: setting("analysisMode", "quick"),
-    quickReviewed: (db.prepare("SELECT count(*) n FROM quick_reviews q JOIN readme_sources s ON s.id=q.source_id JOIN projects p ON p.id=q.project_id WHERE q.id=(SELECT max(id) FROM quick_reviews WHERE project_id=p.id) AND q.stale=0 AND s.revision=p.updated_at").get() as any).n,
+    quickReviewed: (db.prepare(`SELECT count(*) n FROM quick_reviews q JOIN readme_sources s ON s.id=q.source_id JOIN projects p ON p.id=q.project_id WHERE q.id=(SELECT max(id) FROM quick_reviews WHERE project_id=p.id) AND q.stale=0 AND s.revision=p.updated_at AND ${activeSql()}`).get() as any).n,
     snapshots: (
       db
         .prepare(
@@ -130,7 +133,7 @@ app.get("/api/tracks", (_req, res) =>
       count: (
         db
           .prepare(
-            "SELECT count(*) n FROM projects WHERE coalesce(manual_track_id,track_id)=?",
+            `SELECT count(*) n FROM projects p WHERE coalesce(manual_track_id,track_id)=? AND ${activeSql()}`,
           )
           .get(t.id) as any
       ).n,
@@ -371,12 +374,29 @@ app.post("/api/jobs/:id/cancel", (req, res) => {
   ).run(now(), idParam(req.params.id));
   res.json({ ok: true });
 });
+// Activity window in hours (0 = all). A fresh sync refreshes pushed_at for every repo.
+app.patch("/api/settings/activity", (req, res) => {
+  const { hours } = z.object({ hours: z.union([z.literal(0), z.literal(24), z.literal(48)]) }).parse(req.body);
+  setSetting("activityHours", hours);
+  if (hours) enqueue("sync");
+  res.json({ ok: true });
+});
+// Queued jobs are deleted; running ones are cancelled and stop within a second.
+app.post("/api/queue/clear", (_req, res) => {
+  const result = db.transaction(() => ({
+    deleted: db.prepare("DELETE FROM jobs WHERE state='queued'").run().changes,
+    cancelled: db
+      .prepare("UPDATE jobs SET state='cancelled',updated_at=? WHERE state='running'")
+      .run(now()).changes,
+  }))();
+  res.json(result);
+});
 app.post("/api/queue", (req, res) => {
   const { paused } = z.object({ paused: z.boolean() }).parse(req.body);
   setSetting("paused", paused);
   setSetting(
     "pauseReason",
-    paused ? "Пауза пользователя. Текущее задание завершится." : "",
+    paused ? "Пауза пользователя. Текущие задания завершатся." : "",
   );
   res.json({ ok: true });
 });
@@ -398,6 +418,9 @@ app.get("/api/harnesses", async (req, res) => {
     items: harnessCache.data,
     selected: setting("harness", "codex"),
     model: setting("model", ""),
+    quickModel: setting("quickModel", ""),
+    concurrency: setting("concurrency", 3),
+    models: modelOptions(),
   });
 });
 app.patch("/api/harnesses", (req, res) => {
@@ -408,10 +431,18 @@ app.patch("/api/harnesses", (req, res) => {
         .string()
         .max(120)
         .regex(/^[\w./:-]*$/),
+      quickModel: z
+        .string()
+        .max(120)
+        .regex(/^[\w./:-]*$/)
+        .default(""),
+      concurrency: z.number().int().min(1).max(8).default(3),
     })
     .parse(req.body);
   setSetting("harness", v.harness);
   setSetting("model", v.model);
+  setSetting("quickModel", v.quickModel);
+  setSetting("concurrency", v.concurrency);
   res.json({ ok: true });
 });
 app.post("/api/chat", (req, res) => {

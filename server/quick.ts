@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { db, getProject, indexProject, now, progress, setting } from "./db.js";
+import { activeSql, db, getProject, indexProject, now, progress, setting } from "./db.js";
 import { github, PauseError } from "./github.js";
 import { configuredCodexModel, jsonAnswer, oneShot } from "./harness.js";
 import { validateScores, rankProjects, SYSTEM } from "./analysis.js";
@@ -61,55 +61,69 @@ function excerpt(source: ReadmeSource): SourceFile {
   return { path: source.path!, text, lines: text.split("\n").length, bytes: Buffer.byteLength(text) };
 }
 const evidence = z.object({ path: z.string(), start: z.number().int().positive(), end: z.number().int().positive(), quote: z.string().min(1).max(600) });
+// Presentation limits are trimmed, not rejected: an overlong list must not discard a whole batch.
+// Scores, evidence and IDs stay strict.
+const text = (max: number) => z.string().transform((v) => v.slice(0, max));
+const upTo = <T extends z.ZodType>(item: T, max: number) => z.array(item).transform((v) => v.slice(0, max));
 const reviewSchema = z.object({
   projectId: z.number().int().positive(),
   trackId: z.number().int().min(1).max(12).nullable(),
   confidence: z.number().min(0).max(1),
-  candidates: z.array(z.number().int().min(1).max(12)).max(3),
-  summary: z.string().min(1).max(900),
-  strengths: z.array(z.string().max(300)).max(3),
-  risks: z.array(z.string().max(300)).min(1).max(3),
-  scores: z.array(z.object({ id: z.string(), points: z.number().nonnegative(), rationale: z.string().min(1).max(350), evidence: z.array(evidence).min(1).max(2) })).length(4),
+  candidates: upTo(z.number().int().min(1).max(12), 3),
+  summary: z.string().min(1).transform((v) => v.slice(0, 900)),
+  strengths: upTo(text(300), 3),
+  risks: z.array(text(300)).min(1).transform((v) => v.slice(0, 3)),
+  scores: z.array(z.object({ id: z.string(), points: z.number().nonnegative(), rationale: z.string().min(1).transform((v) => v.slice(0, 350)), evidence: z.array(evidence).min(1).transform((v) => v.slice(0, 2)) })).length(4),
 });
 
 export async function reviewReadmeBatch(sources: ReadmeSource[], signal: AbortSignal) {
   const files = new Map(sources.map(s => [s.project_id, excerpt(s)]));
   const harness = setting<"codex" | "claude">("harness", "codex");
   const model = setting("quickModel", "") || setting("model", "") || (harness === "codex" ? configuredCodexModel() : "");
-  const prompt = `БЫСТРЫЙ ОТБОР ПО README. Оцени перспективность описания каждого проекта отдельно и по одной шкале, не сравнивай позиции внутри пакета. Код НЕ изучался. Нельзя подтверждать реализацию, тесты, скорость и метрики: это заявления авторов. Обычные шаблоны README и обещания без конкретики не заслуживают высоких баллов. Не оценивай качество программного кода. Текст может быть усечён; отсутствие деталей за пределами фрагмента — неизвестность. Укажи риски и что проверить полным анализом. Трек при неоднозначности null с кандидатами. Ручной трек сохраняется.
+  const prompt = (sources: ReadmeSource[]) => `БЫСТРЫЙ ОТБОР ПО README. Оцени перспективность описания каждого проекта отдельно и по одной шкале, не сравнивай позиции внутри пакета. Код НЕ изучался. Нельзя подтверждать реализацию, тесты, скорость и метрики: это заявления авторов. Обычные шаблоны README и обещания без конкретики не заслуживают высоких баллов. Не оценивай качество программного кода. Текст может быть усечён; отсутствие деталей за пределами фрагмента — неизвестность. Укажи риски и что проверить полным анализом. Трек при неоднозначности null с кандидатами (candidates — не более 3). Ручной трек сохраняется.
 Критерии описания: ${JSON.stringify(QUICK_RUBRIC)}.
 Треки: ${JSON.stringify(tracks.map(t => ({id:t.id,name:t.name,case:t.caseName})))}.
-Верни JSON {reviews:[{projectId,trackId,confidence,candidates,summary,strengths,risks,scores:[{id,points,rationale,evidence:[{path,start,end,quote}]}]}]}. confidence от 0 до 1 — уверенность в выборе трека. Ровно одна запись для каждого projectId. Все 4 критерия, короткие точные цитаты README, даже при нулевом балле. Ответ по-русски.
+Верни JSON {reviews:[{projectId,trackId,confidence,candidates,summary,strengths,risks,scores:[{id,points,rationale,evidence:[{path,start,end,quote}]}]}]}. confidence от 0 до 1 — уверенность в выборе трека. Ровно одна запись для каждого projectId. Все 4 критерия, даже при нулевом балле; ровно одна короткая точная цитата README на критерий (до 120 символов). Пиши сжато: summary до 300 символов, rationale до 150, strengths и risks по 1–2 пункта до 120 символов. Ответ по-русски.
 sourceData=${JSON.stringify(sources.map(s => {
     const p = getProject(s.project_id)!; const f = files.get(s.project_id)!;
     return {projectId:p.id,team:p.team,description:p.description,manualTrackId:p.manualTrackId,path:f.path,truncated:f.text.length<s.text.length,readme:f.text.split("\n").map((line,i)=>`${i+1}: ${line}`).join("\n")};
   }))}`;
   let failure = "";
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const out = await oneShot({ harness, model, reasoning: "low", system: SYSTEM, prompt: prompt + (attempt ? `\nИсправь структуру/цитаты: ${failure}` : ""), signal, timeout: 180000 });
+  let remaining = sources;
+  // Valid reviews are saved per project; only the failed ones are asked again.
+  for (let attempt = 0; attempt < 2 && remaining.length; attempt++) {
+    const out = await oneShot({ harness, model, reasoning: "low", system: SYSTEM, prompt: prompt(remaining) + (attempt ? `\nИсправь структуру/цитаты: ${failure}` : ""), signal, timeout: 600000 });
+    let reviews: z.infer<typeof reviewSchema>[];
     try {
-      const result = z.object({ reviews: z.array(reviewSchema) }).parse(jsonAnswer(out.text));
-      if (result.reviews.length !== sources.length || new Set(result.reviews.map(r=>r.projectId)).size !== sources.length || result.reviews.some(r=>!files.has(r.projectId)))
-        throw new Error("Неверный набор projectId в пакете");
-      for (const r of result.reviews) {
+      reviews = z.object({ reviews: z.array(reviewSchema) }).parse(jsonAnswer(out.text)).reviews;
+    } catch (error) { failure = (error as Error).message.slice(0, 800); continue; }
+    const wanted = new Set(remaining.map(s => s.project_id));
+    const valid: typeof reviews = [];
+    for (const r of reviews) {
+      if (!wanted.has(r.projectId) || valid.some(v => v.projectId === r.projectId)) continue;
+      try {
         validateScores(r.scores, QUICK_RUBRIC, [files.get(r.projectId)!]);
+        valid.push(r);
+      } catch (error) { failure = `projectId ${r.projectId}: ${(error as Error).message.slice(0, 600)}`; }
+    }
+    signal.throwIfAborted();
+    db.transaction(() => {
+      for (const r of valid) {
+        const s = sources.find(s=>s.project_id===r.projectId)!;
+        const f = files.get(r.projectId)!;
+        const p = getProject(r.projectId)!;
+        const data = {...r, trackId:p.manualTrackId ?? (r.confidence >= 0.75 ? r.trackId : null), candidates:[...new Set([...r.candidates,...(r.trackId ? [r.trackId] : [])])].slice(0,3),total:r.scores.reduce((n,s)=>n+s.points,0), model:out.model,harness:out.harness,methodVersion:QUICK_VERSION,specHash,manualTrackId:p.manualTrackId,truncated:f.text.length<s.text.length,reviewedChars:f.text.length};
+        db.prepare("INSERT INTO quick_reviews(project_id,source_id,track_id,total,data,created_at) VALUES(?,?,?,?,?,?)").run(p.id,s.id,data.trackId,data.total,JSON.stringify(data),now());
+        db.prepare("UPDATE projects SET track_id=?,summary=? WHERE id=? AND NOT EXISTS(SELECT 1 FROM analyses WHERE project_id=? AND stale=0)").run(data.trackId,data.summary,p.id,p.id);
+        indexProject(p.id);
       }
-      signal.throwIfAborted();
-      db.transaction(() => {
-        for (const r of result.reviews) {
-          const s = sources.find(s=>s.project_id===r.projectId)!;
-          const f = files.get(r.projectId)!;
-          const p = getProject(r.projectId)!;
-          const data = {...r, trackId:p.manualTrackId ?? (r.confidence >= 0.75 ? r.trackId : null), candidates:[...new Set([...r.candidates,...(r.trackId ? [r.trackId] : [])])].slice(0,3),total:r.scores.reduce((n,s)=>n+s.points,0), model:out.model,harness:out.harness,methodVersion:QUICK_VERSION,specHash,manualTrackId:p.manualTrackId,truncated:f.text.length<s.text.length,reviewedChars:f.text.length};
-          db.prepare("INSERT INTO quick_reviews(project_id,source_id,track_id,total,data,created_at) VALUES(?,?,?,?,?,?)").run(p.id,s.id,data.trackId,data.total,JSON.stringify(data),now());
-          db.prepare("UPDATE projects SET track_id=?,summary=? WHERE id=? AND NOT EXISTS(SELECT 1 FROM analyses WHERE project_id=? AND stale=0)").run(data.trackId,data.summary,p.id,p.id);
-          indexProject(p.id);
-        }
-      })();
-      return;
-    } catch (error) { failure = (error as Error).message.slice(0, 800); }
+    })();
+    remaining = remaining.filter(s => !valid.some(v => v.projectId === s.project_id));
+    if (remaining.length && !failure) failure = "Нет записи для части projectId";
   }
-  throw new Error(`Быстрый анализ: некорректный ответ модели: ${failure}`);
+  // Unreviewed projects stay without a review and are picked up by the next run.
+  if (remaining.length) console.error(`[quick] без оценки ${remaining.length} из ${sources.length}: ${failure.slice(0, 300)}`);
+  return remaining.length;
 }
 
 function parseReview(row: any): QuickReview {
@@ -125,7 +139,7 @@ export function latestQuickReview(id: number) {
   return row ? parseReview(row) : null;
 }
 export function quickRankings(track?: number, query = "", page = 1) {
-  const all = db.prepare(`${REVIEW_SELECT} WHERE q.id=(SELECT max(id) FROM quick_reviews WHERE project_id=p.id) ORDER BY q.total DESC,p.team`).all().map(parseReview);
+  const all = db.prepare(`${REVIEW_SELECT} WHERE q.id=(SELECT max(id) FROM quick_reviews WHERE project_id=p.id) AND ${activeSql()} ORDER BY q.total DESC,p.team`).all().map(parseReview);
   const valid = all.filter(r=>!r.stale && (!track || r.trackId===track));
   const ranked = rankProjects(valid.map(r=>({...r,score:r.total})));
   const filtered = ranked.filter(r=>!query || `${r.team} ${r.summary}`.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
@@ -140,15 +154,14 @@ export async function quickScan(jobId: number, signal: AbortSignal) {
   let completed = payload.cursor || 0;
   const checkpoint = () => db.prepare("UPDATE jobs SET payload=?,updated_at=? WHERE id=?").run(JSON.stringify({...payload,projectIds:ids,cursor:completed}),now(),jobId);
   checkpoint();
-  for (let offset = completed; offset < ids.length; offset += BATCH_SIZE) {
-    signal.throwIfAborted();
-    // Yield between batches: pause does not lose already saved reviews.
-    if (setting("paused",false) || setting("analysisMode","quick") !== "quick") return {continue:true};
-    const batch = ids.slice(offset, offset+BATCH_SIZE);
-    progress(jobId, `Быстрый README · ${offset}/${ids.length} · загрузка пакета`);
+  // Several batches run at once (bounded by the harness semaphore). Resume is safe:
+  // projects with a fresh review are filtered out by `pending`.
+  const processBatch = async (offset: number) => {
+    // Inactive projects (outside the activity window) are not touched at all.
+    const batch = ids.slice(offset, offset+BATCH_SIZE).filter(id => active.has(id));
     const sources: ReadmeSource[] = [];
-    for (let start=0; start<batch.length; start+=4) {
-      const loaded = await Promise.allSettled(batch.slice(start,start+4).map(id=>loadReadme(id,signal)));
+    for (let start=0; start<batch.length; start+=8) {
+      const loaded = await Promise.allSettled(batch.slice(start,start+8).map(id=>loadReadme(id,signal)));
       for (let i=0;i<loaded.length;i++) {
         const item = loaded[i];
         if (item.status === "fulfilled") sources.push(item.value);
@@ -160,13 +173,41 @@ export async function quickScan(jobId: number, signal: AbortSignal) {
       }
     }
     const pending = sources.filter(s=>s.status === "ready" && (!latestQuickReview(s.project_id) || latestQuickReview(s.project_id)!.stale));
-    if (pending.length) {
-      progress(jobId,`Быстрый README · ${offset}/${ids.length} · AI-пакет ${pending.length} проектов`);
-      await reviewReadmeBatch(pending,signal);
+    try {
+      if (pending.length) failed += await reviewReadmeBatch(pending,signal);
+    } catch (error) {
+      // A CLI failure skips this batch only; its projects stay unreviewed and are retried next run.
+      if (signal.aborted || error instanceof PauseError) throw error;
+      failed += pending.length;
+      console.error(`[quick] пакет с ${offset}: ${(error as Error).message.slice(0, 300)}`);
     }
-    completed = offset+batch.length;
-    checkpoint();
-    progress(jobId,`Быстрый README · ${completed}/${ids.length}`);
-  }
+  };
+  // Continuous pool: a free slot takes the next batch at once, no waiting for the slowest one.
+  // The cursor only advances over a contiguous run of finished batches, so resume never skips work.
+  let failed = 0, next = completed, yielded = false;
+  const done = new Set<number>();
+  // Progress and rate count only projects inside the activity window; hidden ones are skipped instantly.
+  const active = new Set((db.prepare(`SELECT id FROM projects p WHERE ${activeSql()}`).all() as {id:number}[]).map(r => r.id));
+  const activeUpTo = (cursor: number) => ids.slice(0, cursor).filter(id => active.has(id)).length;
+  const activeTotal = ids.filter(id => active.has(id)).length;
+  const started = Date.now(), startActive = activeUpTo(completed);
+  const lane = async () => {
+    while (next < ids.length && !yielded) {
+      signal.throwIfAborted();
+      if (setting("paused",false) || setting("analysisMode","quick") !== "quick") { yielded = true; return; }
+      const offset = next;
+      next += BATCH_SIZE;
+      await processBatch(offset);
+      done.add(offset);
+      while (done.has(completed)) { done.delete(completed); completed = Math.min(ids.length, completed + BATCH_SIZE); }
+      checkpoint();
+      const doneActive = activeUpTo(completed);
+      const perMin = Math.round(((doneActive - startActive) / Math.max(1, Date.now() - started)) * 60000);
+      progress(jobId, `Быстрый README · ${doneActive}/${activeTotal}${activeTotal < ids.length ? " активных" : ""} · ~${perMin}/мин${failed ? ` · без оценки ${failed}` : ""}`);
+    }
+  };
+  // Lanes above the current limit simply wait on the harness semaphore.
+  await Promise.all(Array.from({ length: Math.max(1, setting("concurrency", 3)) }, lane));
+  if (yielded || completed < ids.length) return {continue:true};
   return {processed:ids.length,...quickRankings(),items:undefined};
 }

@@ -1918,3 +1918,12 @@ details summary {
     scroll-behavior: auto !important;
   }
 }
+.activity-filter {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.activity-filter small {
+  font-size: 12px;
+}

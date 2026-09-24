@@ -31,6 +31,7 @@ import {
   Send,
   FolderGit2,
   Activity,
+  Trash2,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { QUICK_RUBRIC, type QuickReview } from "../shared/types.js";
@@ -218,6 +219,8 @@ function Markdown({ text, base }: { text: string; base?: string }) {
 }
 type Stats = {
   total: number;
+  allProjects: number;
+  activityHours: number;
   quickReviewed: number;
   analysisMode: "quick" | "full";
   snapshots: number;
@@ -260,7 +263,7 @@ function App() {
   }, [toast]);
   const { data: tracks } = useApi<Track[]>(
     "/tracks",
-    `${stats?.analyzed}:${stats?.quickReviewed}:${revision}`,
+    `${stats?.analyzed}:${stats?.quickReviewed}:${stats?.activityHours}:${revision}`,
   );
   const path = location.split("?")[0],
     params = new URLSearchParams(location.split("?")[1]);
@@ -462,7 +465,7 @@ function App() {
             <Rankings
               tracks={tracks || []}
               params={params}
-              revision={stats?.analyzed}
+              revision={`${stats?.analyzed}:${stats?.activityHours}`}
             />
           ) : path === "/compare" ? (
             <Compare
@@ -515,6 +518,36 @@ function App() {
         </div>
       )}
     </div>
+  );
+}
+// Global activity window: projects without a recent push are hidden and not processed.
+function ActivityFilter({ stats }: { stats: Stats | null }) {
+  const [value, setValue] = useState<number | null>(null);
+  const hours = value ?? stats?.activityHours ?? 0;
+  const hidden = stats ? stats.allProjects - stats.total : 0;
+  return (
+    <label className="activity-filter">
+      <select
+        aria-label="Последний коммит"
+        value={hours}
+        onChange={async (e) => {
+          const next = Number(e.target.value);
+          setValue(next);
+          try {
+            await api("/settings/activity", { hours: next }, "PATCH");
+          } finally {
+            setTimeout(() => setValue(null), 3000);
+          }
+        }}
+      >
+        <option value={0}>Все проекты</option>
+        <option value={24}>Коммит за последние 24 ч</option>
+        <option value={48}>Коммит за последние 48 ч</option>
+      </select>
+      {hours > 0 && hidden > 0 && (
+        <small className="muted">Скрыто неактивных: {hidden}</small>
+      )}
+    </label>
   );
 }
 function Catalog({
@@ -673,6 +706,7 @@ function Catalog({
         </button>
       </div>
       <div className="filters">
+        <ActivityFilter stats={stats} />
         <label className="search-field">
           <Search size={18} />
           <input
@@ -896,7 +930,7 @@ function EvidenceLinks({
 }
 function QuickRankingPage({tracks,stats,params,revision}:{tracks:Track[];stats:Stats|null;params:URLSearchParams;revision:number}) {
   const [chosen,setChosen] = useState<number[]>([]), [notice,setNotice] = useState(""), [busy,setBusy] = useState(false);
-  const {data,error} = useApi<{items:QuickReview[];total:number;page:number;limit:number;reviewed:number;stale:number;statuses:{status:string;count:number}[]}>(`/quick/rankings?${params}`,`${revision}:${stats?.quickReviewed}:${stats?.running[0]?.progress}`);
+  const {data,error} = useApi<{items:QuickReview[];total:number;page:number;limit:number;reviewed:number;stale:number;statuses:{status:string;count:number}[]}>(`/quick/rankings?${params}`,`${revision}:${stats?.quickReviewed}:${stats?.activityHours}:${stats?.running[0]?.progress}`);
   function change(key:string,value:string) { const next = new URLSearchParams(params); value ? next.set(key,value) : next.delete(key); if(key!=="page")next.delete("page");navigate(`/quick?${next}`); }
   async function run(full:boolean) {
     setBusy(true);setNotice("");
@@ -917,7 +951,7 @@ function QuickRankingPage({tracks,stats,params,revision}:{tracks:Track[];stats:S
     <div className="notice">Предварительный рейтинг описаний, а не качества кода. Треки определяются автоматически; неоднозначные случаи требуют классификации. До 6 000 символов README на проект, до 12 проектов в запросе. Исходники и команды проектов не запускаются.</div>
     <div className="quick-progress"><strong>{fmt(data?.reviewed || 0)} / {fmt(stats?.total || 0)} README оценено</strong><span>{job?.progress || (stats?.paused ? stats.pauseReason : "Результаты сохраняются после каждого пакета")}</span></div>
     {!!data?.statuses.length && <p className="muted">{data.statuses.filter(s=>s.status!=="ready").map(s=>`${({missing:"Нет README",empty:"Пустые",too_large:"README превышает лимит",error:"Ошибки загрузки"} as Record<string,string>)[s.status] || s.status}: ${s.count}`).join(" · ")}{data.stale ? ` · Устаревшие: ${data.stale}` : ""}. Без доступного README баллы не назначаются.</p>}
-    <div className="filters"><input aria-label="Поиск в быстром рейтинге" placeholder="Команда или идея…" value={params.get("q") || ""} onChange={e=>change("q",e.target.value)}/><select aria-label="Трек быстрого рейтинга" value={params.get("track") || ""} onChange={e=>change("track",e.target.value)}><option value="">Все 12 треков</option>{tracks.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><Link to="/rankings" className="text-link">Рейтинг по исходному коду <ArrowRight size={14}/></Link></div>
+    <div className="filters"><ActivityFilter stats={stats} /><input aria-label="Поиск в быстром рейтинге" placeholder="Команда или идея…" value={params.get("q") || ""} onChange={e=>change("q",e.target.value)}/><select aria-label="Трек быстрого рейтинга" value={params.get("track") || ""} onChange={e=>change("track",e.target.value)}><option value="">Все 12 треков</option>{tracks.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><Link to="/rankings" className="text-link">Рейтинг по исходному коду <ArrowRight size={14}/></Link></div>
     <div className="quick-actions"><button className="button" disabled={!data?.items.length} onClick={()=>setChosen(data!.items.slice(0,10).map(r=>r.projectId))}>Выбрать первые 10 на странице</button><button className="text-button" onClick={()=>setChosen([])}>Сбросить</button><button className="button primary" disabled={!chosen.length || busy} onClick={()=>run(true)}><Code2 size={15}/>Проверить код выбранных ({chosen.length})</button></div>
     {notice && <div role="status" className="notice">{notice}</div>}<ErrorBox message={error}/>
     {!data ? <Loading/> : !data.items.length ? <Empty title="Здесь появится отбор по README" detail="Запустите быстрый анализ. Результаты и треки будут появляться по мере обработки пакетов." icon={FileText}/> : <div className="quick-list">{data.items.map(r=><article className="quick-row" key={r.id}><input type="checkbox" aria-label={`Проверить код ${r.team}`} checked={chosen.includes(r.projectId)} disabled={chosen.length>=50 && !chosen.includes(r.projectId)} onChange={()=>setChosen(a=>a.includes(r.projectId)?a.filter(id=>id!==r.projectId):[...a,r.projectId])}/><span className="rank">{r.rank}</span><div><Link to={`/project/${r.projectId}?tab=quick`}><h3>{r.team}</h3></Link><p>{r.summary}</p><span className="badge">{tracks.find(t=>t.id===r.trackId)?.name || "Требует классификации"}</span>{!r.trackId && r.candidates.length>0 && <small> Возможные треки: {r.candidates.map(id=>tracks.find(t=>t.id===id)?.name).join(", ")}</small>}<p className="muted">{r.risks[0]}</p><Link className="text-link" to={`/readme/${r.sourceId}`}>README · {r.sha.slice(0,8)} <ArrowUpRight size={13}/></Link></div><div className="ranking-score">{r.total}<small>/100 · описание</small></div></article>)}</div>}
@@ -1388,6 +1422,12 @@ function Assessment({
         Предварительный анализ кода · {a.model} · {date(a.createdAt)}
         {a.stale && <strong>Оценка устарела</strong>}
       </div>
+      {!!a.coverage?.omitted && (
+        <p className="muted">
+          Проект крупный: {a.coverage.omitted} из {a.coverage.read} файлов не
+          вошли в анализ (читались в первую очередь README, манифесты и код).
+        </p>
+      )}
       {track?.rubricOrigin === "analytical" && (
         <p className="muted">
           Веса в ТЗ отсутствуют. Используется общая аналитическая шкала.
@@ -2070,6 +2110,54 @@ function TrackSource({ id }: { id: number }) {
     <Loading />
   );
 }
+type ModelOption = { id: string; label: string; description: string };
+// Known models as a list; "Другая…" keeps a free-text escape hatch for new model names.
+function ModelSelect({
+  label,
+  value,
+  onChange,
+  options,
+  fallback,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: ModelOption[];
+  fallback: string;
+}) {
+  const [custom, setCustom] = useState(false);
+  const isCustom = custom || (!!value && !options.some((m) => m.id === value));
+  return (
+    <label className="field-label">
+      {label}
+      <select
+        value={isCustom ? "__custom" : value}
+        onChange={(e) => {
+          const v = e.target.value;
+          setCustom(v === "__custom");
+          if (v !== "__custom") onChange(v);
+        }}
+      >
+        <option value="">{fallback}</option>
+        {options.map((m) => (
+          <option key={m.id} value={m.id}>
+            {m.label}
+            {m.description ? ` — ${m.description}` : ""}
+          </option>
+        ))}
+        <option value="__custom">Другая…</option>
+      </select>
+      {isCustom && (
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="Идентификатор модели"
+          autoFocus
+        />
+      )}
+    </label>
+  );
+}
 function Settings({
   stats,
   revision,
@@ -2083,9 +2171,14 @@ function Settings({
     items: HarnessInfo[];
     selected: string;
     model: string;
+    quickModel: string;
+    concurrency: number;
+    models: Record<string, ModelOption[]>;
   }>("/harnesses", revision);
   const [harness, setHarness] = useState("codex"),
     [model, setModel] = useState(""),
+    [quickModel, setQuickModel] = useState(""),
+    [concurrency, setConcurrency] = useState(3),
     [notice, setNotice] = useState(""),
     [filter, setFilter] = useState("");
   const { data: jobs } = useApi<Job[]>(
@@ -2096,6 +2189,8 @@ function Settings({
     if (harnesses) {
       setHarness(harnesses.selected);
       setModel(harnesses.model);
+      setQuickModel(harnesses.quickModel);
+      setConcurrency(harnesses.concurrency);
     }
   }, [harnesses]);
   async function act(path: string, body: unknown = {}, method = "POST") {
@@ -2149,7 +2244,12 @@ function Settings({
                   name="harness"
                   value={h.id}
                   checked={harness === h.id}
-                  onChange={() => setHarness(h.id)}
+                  onChange={() => {
+                    const ids = (harnesses?.models[h.id] || []).map((m) => m.id);
+                    if (model && !ids.includes(model)) setModel("");
+                    if (quickModel && !ids.includes(quickModel)) setQuickModel("");
+                    setHarness(h.id);
+                  }}
                 />
                 <div>
                   <strong>
@@ -2164,18 +2264,44 @@ function Settings({
               </label>
             ))}
           </div>
+          <ModelSelect
+            label="Модель полного анализа"
+            value={model}
+            onChange={setModel}
+            options={harnesses?.models[harness] || []}
+            fallback={
+              harness === "codex"
+                ? `По умолчанию CLI${harnesses?.items.find((h) => h.id === "codex")?.model ? ` (${harnesses.items.find((h) => h.id === "codex")!.model})` : ""}`
+                : "По умолчанию CLI"
+            }
+          />
+          <ModelSelect
+            label="Модель быстрого отбора по README"
+            value={quickModel}
+            onChange={setQuickModel}
+            options={harnesses?.models[harness] || []}
+            fallback="Как у полного анализа"
+          />
           <label className="field-label">
-            Модель
+            Параллельных AI-вызовов
             <input
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder="По умолчанию CLI"
+              type="number"
+              min={1}
+              max={8}
+              value={concurrency}
+              onChange={(e) => setConcurrency(Number(e.target.value))}
             />
           </label>
           <div className="button-group">
             <button
               className="button primary"
-              onClick={() => act("/harnesses", { harness, model }, "PATCH")}
+              onClick={() =>
+                act(
+                  "/harnesses",
+                  { harness, model, quickModel, concurrency },
+                  "PATCH",
+                )
+              }
             >
               Сохранить
             </button>
@@ -2234,6 +2360,27 @@ function Settings({
           <option value="queued">В очереди</option>
           <option value="done">Готово</option>
         </select>
+        <button
+          className="button"
+          disabled={!stats?.queued && !stats?.running.length}
+          onClick={async () => {
+            if (
+              !confirm(
+                `Удалить все задания из очереди (${stats?.queued ?? 0}) и остановить выполняемые (${stats?.running.length ?? 0})? Готовые анализы и снимки сохранятся.`,
+              )
+            )
+              return;
+            try {
+              const r = await api<{ deleted: number; cancelled: number }>("/queue/clear", {});
+              setNotice(`Удалено из очереди: ${r.deleted}, остановлено: ${r.cancelled}`);
+              refresh();
+            } catch (e) {
+              setNotice((e as Error).message);
+            }
+          }}
+        >
+          <Trash2 size={16} /> Очистить очередь
+        </button>
       </div>
       <div className="table-wrap">
         <table className="simple-table jobs-table">

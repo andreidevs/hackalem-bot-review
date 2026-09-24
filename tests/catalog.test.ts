@@ -793,3 +793,43 @@ it("aborting an archive in the middle of an entry rejects without crashing the w
     clearTimeout(timer);
   }
 });
+
+it("reads README, manifests and code before tests and data when chunking", () => {
+  const file = (path: string) => ({ path, text: path, bytes: 1, lines: 1 });
+  const order = (paths: string[]) =>
+    sourceChunks(paths.map(file))
+      .join("")
+      .match(/FILE (\S+)/g)!
+      .map((m) => m.slice(5));
+  expect(
+    order(["tests/a.py", "data/x.json", "docs/guide.md", "src/app.py", "package.json", "README.md"]),
+  ).toEqual(["README.md", "package.json", "src/app.py", "docs/guide.md", "data/x.json", "tests/a.py"]);
+});
+
+it("corrects shifted line numbers for a verbatim quote but rejects invented text", () => {
+  const file = { path: "README.md", text: "# T\n\nfirst\nsecond line here\nthird", bytes: 1, lines: 5 };
+  const e = { path: "README.md", start: 2, end: 2, quote: "second line here" };
+  validateEvidence([e], [file]);
+  expect(e).toMatchObject({ start: 4, end: 4 });
+  expect(() =>
+    validateEvidence([{ path: "README.md", start: 2, end: 2, quote: "not in file" }], [file]),
+  ).toThrow("Цитата не найдена");
+});
+
+it("hides and skips projects without a push inside the activity window", async () => {
+  const { activeSql, isActive } = await import("../server/db.js");
+  const recent = new Date(Date.now() - 3600000).toISOString();
+  db.prepare("UPDATE projects SET pushed_at=? WHERE id=2").run(recent);
+  db.prepare("UPDATE projects SET pushed_at='2020-01-01T00:00:00Z' WHERE id=3").run();
+  try {
+    setSetting("activityHours", 24);
+    expect(isActive(2)).toBe(true);
+    expect(isActive(3)).toBe(false);
+    expect(listProjects().items.map((p) => p.id)).not.toContain(3);
+    setSetting("activityHours", 0);
+    expect(activeSql()).toBe("1");
+    expect(isActive(3)).toBe(true);
+  } finally {
+    setSetting("activityHours", 0);
+  }
+});

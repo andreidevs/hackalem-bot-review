@@ -73,7 +73,7 @@ export interface Analysis {
   specHash: string;
   createdAt: string;
   stale: boolean;
-  coverage: { read: number; skipped: number; chunks: number };
+  coverage: { read: number; skipped: number; chunks: number; omitted?: number };
 }
 export interface Project {
   id: number;
@@ -96,6 +96,7 @@ export interface Project {
   status: string;
   error: string | null;
   updatedAt: string;
+  pushedAt: string;
   syncedAt: string;
   total?: number | null;
   commonTotal?: number | null;

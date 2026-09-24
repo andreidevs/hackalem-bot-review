@@ -35,7 +35,23 @@ if (
   )
 )
   db.exec("ALTER TABLE projects ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'");
+if (
+  !(db.prepare("PRAGMA table_info(projects)").all() as { name: string }[]).some(
+    (c) => c.name === "pushed_at",
+  )
+)
+  db.exec("ALTER TABLE projects ADD COLUMN pushed_at TEXT");
 export const now = () => new Date().toISOString();
+// Activity window: projects without a push in the last N hours are neither processed nor listed.
+// pushed_at comes from the GitHub repo listing; updated_at is the fallback until the next sync.
+export function activeSql(alias = "p") {
+  const hours = setting("activityHours", 0);
+  if (!hours) return "1";
+  const cutoff = new Date(Date.now() - hours * 3600000).toISOString().replace(/\.\d{3}Z$/, "Z");
+  return `coalesce(${alias}.pushed_at,${alias}.updated_at) >= '${cutoff}'`;
+}
+export const isActive = (id: number) =>
+  !!db.prepare(`SELECT 1 FROM projects p WHERE p.id=? AND ${activeSql()}`).get(id);
 export function setting<T>(key: string, fallback: T): T {
   const row = db.prepare("SELECT value FROM settings WHERE key=?").get(key) as
     | { value: string }
@@ -87,6 +103,7 @@ export function project(row: any): Project {
     status: row.stale ? "stale" : row.status,
     error: row.error,
     updatedAt: row.updated_at,
+    pushedAt: row.pushed_at ?? row.updated_at,
     syncedAt: row.synced_at,
     ...(row.analysis_id
       ? {

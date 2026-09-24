@@ -9,6 +9,7 @@ import {
   setSetting,
   setting,
   restoreAnalysisState,
+  activeSql,
 } from "./db.js";
 import { syncOrganization, snapshotProject, PauseError } from "./github.js";
 import { analyzeProject } from "./analysis.js";
@@ -54,24 +55,28 @@ db.prepare(
   "UPDATE jobs SET state='queued',progress='Восстановлено после остановки' WHERE state='running'",
 ).run();
 let stopped = false;
-let active: AbortController | null = null;
+const active = new Set<AbortController>();
 const stop = () => {
   stopped = true;
-  active?.abort();
+  for (const a of active) a.abort();
 };
 process.on("SIGTERM", stop);
 process.on("SIGINT", stop);
 const heartbeat = setInterval(() => setSetting("workerHeartbeat", now()), 2000);
 setSetting("workerHeartbeat", now());
-try {
+// One lane above the AI limit keeps downloads moving while all AI slots are busy;
+// the AI process count itself is capped by the semaphore in harness.ts.
+const LANES = 9;
+async function lane() {
   while (!stopped) {
-    if (setting("paused", false)) {
+    if (setting("paused", false) || active.size >= setting("concurrency", 3) + 1) {
       await new Promise((r) => setTimeout(r, 500));
       continue;
     }
+    // Claim is atomic: better-sqlite3 is synchronous, no await between SELECT and UPDATE.
     const raw = db
       .prepare(
-        "SELECT * FROM jobs WHERE state='queued' AND (type IN ('sync','chat') OR (type='quick' AND ?='quick') OR (type IN ('snapshot','analyze') AND ?='full' AND json_extract(payload,'$.mode')='full')) ORDER BY coalesce(json_extract(payload,'$.priority'),CASE type WHEN 'sync' THEN -30 WHEN 'chat' THEN -20 WHEN 'quick' THEN -15 WHEN 'snapshot' THEN 0 ELSE 10 END),id LIMIT 1",
+        `SELECT * FROM jobs WHERE state='queued' AND (project_id IS NULL OR (NOT EXISTS(SELECT 1 FROM jobs r WHERE r.state='running' AND r.project_id=jobs.project_id) AND EXISTS(SELECT 1 FROM projects p WHERE p.id=jobs.project_id AND ${activeSql()}))) AND (type IN ('sync','chat') OR (type='quick' AND ?='quick') OR (type IN ('snapshot','analyze') AND ?='full' AND json_extract(payload,'$.mode')='full')) ORDER BY coalesce(json_extract(payload,'$.priority'),CASE type WHEN 'sync' THEN -30 WHEN 'chat' THEN -20 WHEN 'quick' THEN -15 WHEN 'snapshot' THEN 0 ELSE 10 END),id LIMIT 1`,
       )
       .get(setting("analysisMode","quick"),setting("analysisMode","quick"));
     if (!raw) {
@@ -82,17 +87,18 @@ try {
     db.prepare(
       "UPDATE jobs SET state='running',attempts=attempts+1,error=NULL,updated_at=? WHERE id=?",
     ).run(now(), job.id);
-    active = new AbortController();
+    const controller = new AbortController();
+    active.add(controller);
     let modeChanged = false;
     const cancellation = setInterval(() => {
       const row = db
         .prepare("SELECT state FROM jobs WHERE id=?")
         .get(job.id) as { state: string };
-      if (row.state === "cancelled") active?.abort();
+      if (row.state === "cancelled") controller.abort();
       const mode = setting<string>("analysisMode","quick");
       if ((job.type === "quick" && mode !== "quick") || (["snapshot","analyze"].includes(job.type) && mode !== "full")) {
         modeChanged = true;
-        active?.abort();
+        controller.abort();
       }
     }, 500);
     try {
@@ -101,14 +107,14 @@ try {
         result = await syncOrganization(
           job.id,
           job.payload.limit as number | undefined,
-          active.signal,
+          controller.signal,
         );
       else if (job.type === "snapshot")
-        result = await snapshotProject(job.id, job.projectId!, active.signal);
+        result = await snapshotProject(job.id, job.projectId!, controller.signal);
       else if (job.type === "analyze")
-        result = await analyzeProject(job.id, job.projectId!, active.signal);
+        result = await analyzeProject(job.id, job.projectId!, controller.signal);
       else if (job.type === "quick") {
-        result = await quickScan(job.id, active.signal);
+        result = await quickScan(job.id, controller.signal);
         if ((result as any)?.continue) {
           db.prepare("UPDATE jobs SET state='queued',updated_at=? WHERE id=? AND state='running'").run(now(),job.id);
           continue;
@@ -118,7 +124,7 @@ try {
         result = await answerChat(
           String(job.payload.question),
           (job.payload.projectIds as number[]) || [],
-          active.signal,
+          controller.signal,
         );
       db.prepare(
         "UPDATE jobs SET state='done',progress='Готово',result=?,updated_at=? WHERE id=? AND state='running'",
@@ -128,10 +134,12 @@ try {
       if (error instanceof PauseError) {
         setSetting("paused", true);
         setSetting("pauseReason", message);
+        // The limit applies to every lane: stop them now, they are requeued below.
+        for (const a of active) a.abort();
         db.prepare(
           "UPDATE jobs SET state='queued',error=?,updated_at=? WHERE id=? AND state='running'",
         ).run(message, now(), job.id);
-      } else if (stopped || modeChanged)
+      } else if (stopped || modeChanged || (controller.signal.aborted && setting("paused", false)))
         db.prepare(
           "UPDATE jobs SET state='queued',updated_at=? WHERE id=? AND state='running'",
         ).run(now(), job.id);
@@ -149,9 +157,12 @@ try {
       console.error(`[job ${job.id}] ${message}`);
     } finally {
       clearInterval(cancellation);
-      active = null;
+      active.delete(controller);
     }
   }
+}
+try {
+  await Promise.all(Array.from({ length: LANES }, lane));
 } finally {
   clearInterval(heartbeat);
   setSetting("workerHeartbeat", null);

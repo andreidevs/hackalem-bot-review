@@ -30,12 +30,21 @@ export async function github(path: string, signal?: AbortSignal) {
   };
   if (token) headers.Authorization = `Bearer ${token}`;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const response = await fetch(`https://api.github.com${path}`, {
-      headers,
-      signal: signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(30000)])
-        : AbortSignal.timeout(30000),
-    });
+    let response: Response;
+    try {
+      response = await fetch(`https://api.github.com${path}`, {
+        headers,
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(30000)])
+          : AbortSignal.timeout(30000),
+      });
+    } catch (error) {
+      // Network error or timeout: retry like a 5xx, but never retry a cancellation.
+      signal?.throwIfAborted();
+      if (attempt === 2) throw error;
+      await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+      continue;
+    }
     if (
       response.status === 429 ||
       (response.status === 403 &&
@@ -84,7 +93,7 @@ export async function syncOrganization(
       seen.add(r.id);
       if (limit && count >= limit) break;
       db.prepare(
-        `INSERT INTO projects(id,name,full_name,team,description,url,branch,language,size,archived,updated_at,synced_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,full_name=excluded.full_name,team=excluded.team,description=excluded.description,url=excluded.url,branch=excluded.branch,language=excluded.language,size=excluded.size,archived=excluded.archived,updated_at=excluded.updated_at,synced_at=excluded.synced_at`,
+        `INSERT INTO projects(id,name,full_name,team,description,url,branch,language,size,archived,updated_at,pushed_at,synced_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,full_name=excluded.full_name,team=excluded.team,description=excluded.description,url=excluded.url,branch=excluded.branch,language=excluded.language,size=excluded.size,archived=excluded.archived,updated_at=excluded.updated_at,pushed_at=excluded.pushed_at,synced_at=excluded.synced_at`,
       ).run(
         r.id,
         r.name,
@@ -98,6 +107,7 @@ export async function syncOrganization(
         r.size,
         r.archived ? 1 : 0,
         r.updated_at,
+        r.pushed_at ?? null,
         now(),
       );
       indexProject(r.id);

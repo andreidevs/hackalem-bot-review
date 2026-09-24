@@ -1,4 +1,4 @@
-import { db, project, latestAnalysis, getProject, getSnapshot } from "./db.js";
+import { db, project, latestAnalysis, getProject, getSnapshot, activeSql } from "./db.js";
 import { rankProjects } from "./analysis.js";
 import type { Project } from "../shared/types.js";
 export function ftsQuery(q: string) {
@@ -17,7 +17,7 @@ export function listProjects(
     limit?: number;
   } = {},
 ) {
-  const conditions: string[] = [],
+  const conditions: string[] = [activeSql()],
     args: unknown[] = [];
   const term = ftsQuery(params.q || "");
   if (term) {
@@ -68,7 +68,7 @@ export function listProjects(
 export function rankings(track?: number) {
   const rows = db
     .prepare(
-      `SELECT p.*,a.id AS analysis_id,a.total,a.common_total,a.stale FROM projects p JOIN analyses a ON a.id=(SELECT id FROM analyses WHERE project_id=p.id ORDER BY id DESC LIMIT 1) WHERE a.stale=0 AND p.status IN ('analyzed','unclassified') ${track ? "AND coalesce(p.manual_track_id,p.track_id)=? AND a.total IS NOT NULL" : ""} ORDER BY ${track ? "a.total" : "a.common_total"} DESC,p.team COLLATE NOCASE`,
+      `SELECT p.*,a.id AS analysis_id,a.total,a.common_total,a.stale FROM projects p JOIN analyses a ON a.id=(SELECT id FROM analyses WHERE project_id=p.id ORDER BY id DESC LIMIT 1) WHERE a.stale=0 AND ${activeSql()} AND p.status IN ('analyzed','unclassified') ${track ? "AND coalesce(p.manual_track_id,p.track_id)=? AND a.total IS NOT NULL" : ""} ORDER BY ${track ? "a.total" : "a.common_total"} DESC,p.team COLLATE NOCASE`,
     )
     .all(...(track ? [track] : []));
   return rankProjects(

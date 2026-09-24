@@ -12,6 +12,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join, delimiter } from "node:path";
 import { PauseError } from "./github.js";
+import { setting } from "./db.js";
 import type { HarnessInfo } from "../shared/types.js";
 export function findBinary(name: string): string | null {
   for (const dir of [
@@ -121,6 +122,34 @@ export function configuredCodexModel() {
     return "";
   }
 }
+export type ModelOption = { id: string; label: string; description: string };
+// Codex keeps the models available to the subscription in its own cache; Claude CLI accepts stable aliases.
+export function modelOptions(): Record<"codex" | "claude", ModelOption[]> {
+  let codex: ModelOption[] = [];
+  try {
+    const cache = JSON.parse(
+      readFileSync(
+        join(process.env.CODEX_HOME || join(homedir(), ".codex"), "models_cache.json"),
+        "utf8",
+      ),
+    );
+    codex = (cache.models || [])
+      .filter((m: any) => m.visibility === "list" && m.slug)
+      .sort((a: any, b: any) => (a.priority ?? 99) - (b.priority ?? 99))
+      .map((m: any) => ({ id: m.slug, label: m.display_name || m.slug, description: m.description || "" }));
+  } catch {}
+  const configured = configuredCodexModel();
+  if (configured && !codex.some((m) => m.id === configured))
+    codex.unshift({ id: configured, label: configured, description: "Из config.toml" });
+  return {
+    codex,
+    claude: [
+      { id: "opus", label: "Claude Opus", description: "Самая сильная, медленнее" },
+      { id: "sonnet", label: "Claude Sonnet", description: "Баланс качества и скорости" },
+      { id: "haiku", label: "Claude Haiku", description: "Быстрая и экономная" },
+    ],
+  };
+}
 export async function detectHarness(
   id: "codex" | "claude",
 ): Promise<HarnessInfo> {
@@ -163,7 +192,9 @@ export async function detectHarness(
     }
     result.note = result.ready
       ? "Готов к анализу"
-      : `Выполните ${id === "codex" ? "codex login" : "claude auth login"} в терминале`;
+      : process.env.HACKALEM_CONTAINER
+        ? `Вход с хоста в контейнер не переносится. Выполните: docker compose exec hackalem ${id === "codex" ? "codex login --device-auth" : "claude auth login"}`
+        : `Выполните ${id === "codex" ? "codex login" : "claude auth login"} в терминале`;
   } catch {
     result.note = "Не удалось проверить CLI";
   }
@@ -235,6 +266,26 @@ export function codexArgs(system: string, model: string, reasoning: "low" | "med
   args.push("-");
   return args;
 }
+// ponytail: in-process semaphore; the limit is re-read on every acquire so the UI setting applies live.
+let running = 0;
+const waiting: (() => void)[] = [];
+async function acquire(signal?: AbortSignal) {
+  while (running >= Math.max(1, setting("concurrency", 3))) {
+    signal?.throwIfAborted();
+    await new Promise<void>((r) => {
+      waiting.push(r);
+      // Wake periodically too: the limit may be raised while we wait.
+      setTimeout(r, 1000);
+    });
+  }
+  running++;
+}
+function release() {
+  running--;
+  waiting.splice(0).forEach((r) => r());
+}
+// Only positive readiness is cached: a failed check must be re-run next time.
+const readyAt = new Map<string, number>();
 export async function oneShot(options: {
   harness: "codex" | "claude";
   model?: string;
@@ -250,11 +301,16 @@ export async function oneShot(options: {
       "Выбранный CLI не установлен. Откройте настройки.",
       "auth",
     );
-  const readiness = await detectHarness(options.harness);
-  if (!readiness.ready) throw new PauseError(readiness.note, "auth");
+  const readyKey = options.harness + ":" + bin;
+  if (Date.now() - (readyAt.get(readyKey) || 0) > 60000) {
+    const readiness = await detectHarness(options.harness);
+    if (!readiness.ready) throw new PauseError(readiness.note, "auth");
+    readyAt.set(readyKey, Date.now());
+  }
   const model =
     options.model ||
     (options.harness === "codex" ? configuredCodexModel() : "");
+  await acquire(options.signal);
   const cwd = mkdtempSync(join(tmpdir(), "hackalem-ai-"));
   try {
     const args =
@@ -301,6 +357,7 @@ export async function oneShot(options: {
     }
     if (out.code !== 0 || !text) {
       const kind = classifyFailure(out.stderr + out.stdout);
+      if (kind === "auth") readyAt.delete(readyKey);
       if (kind !== "error")
         throw new PauseError(
           kind === "limit"
@@ -318,6 +375,7 @@ export async function oneShot(options: {
       harness: options.harness,
     };
   } finally {
+    release();
     rmSync(cwd, { recursive: true, force: true });
   }
 }
