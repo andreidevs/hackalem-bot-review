@@ -29,24 +29,21 @@ CREATE INDEX IF NOT EXISTS readme_sources_project ON readme_sources(project_id,i
 CREATE TABLE IF NOT EXISTS quick_reviews(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id),source_id INTEGER NOT NULL REFERENCES readme_sources(id),track_id INTEGER,total REAL NOT NULL,data TEXT NOT NULL,created_at TEXT NOT NULL,stale INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS quick_reviews_project ON quick_reviews(project_id,id DESC);
 `);
-if (
-  !(db.prepare("PRAGMA table_info(projects)").all() as { name: string }[]).some(
-    (c) => c.name === "tags",
-  )
-)
-  db.exec("ALTER TABLE projects ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'");
-if (
-  !(db.prepare("PRAGMA table_info(projects)").all() as { name: string }[]).some(
-    (c) => c.name === "pushed_at",
-  )
-)
-  db.exec("ALTER TABLE projects ADD COLUMN pushed_at TEXT");
-if (
-  !(db.prepare("PRAGMA table_info(projects)").all() as { name: string }[]).some(
-    (c) => c.name === "commit_stats",
-  )
-)
-  db.exec("ALTER TABLE projects ADD COLUMN commit_stats TEXT");
+// Both processes run this at startup: a column added by the other one in between is fine.
+function addColumn(name: string, definition: string, table = "projects") {
+  const exists = () =>
+    (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((c) => c.name === name);
+  if (exists()) return;
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+  } catch (error) {
+    if (!exists()) throw error;
+  }
+}
+addColumn("tags", "TEXT NOT NULL DEFAULT '[]'");
+addColumn("pushed_at", "TEXT");
+addColumn("commit_stats", "TEXT");
+addColumn("checklist", "TEXT", "readme_sources");
 export const now = () => new Date().toISOString();
 // Activity window: projects without a push in the last N hours are neither processed nor listed.
 // pushed_at comes from the GitHub repo listing; updated_at is the fallback until the next sync.
@@ -88,10 +85,14 @@ db.transaction(() => {
       "INSERT INTO tracks VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET hash=excluded.hash,data=excluded.data",
     ).run(t.id, t.hash, JSON.stringify(t));
   }
-})();
+}).immediate(); // API and worker start together: take the write lock up front so the other waits instead of failing with SQLITE_BUSY_SNAPSHOT.
 db.prepare(
   "UPDATE analyses SET stale=1 WHERE json_extract(data,'$.methodVersion') != ?",
 ).run(METHOD_VERSION);
+// Analyses made before the HackAlem jury scale existed are redone; cached code chunks are reused.
+db.prepare(
+  "UPDATE analyses SET stale=1 WHERE stale=0 AND json_extract(data,'$.hackalemTotal') IS NULL",
+).run();
 export function project(row: any): Project {
   return {
     id: row.id,
@@ -116,6 +117,11 @@ export function project(row: any): Project {
     updatedAt: row.updated_at,
     pushedAt: row.pushed_at ?? row.updated_at,
     commitStats: row.commit_stats ? JSON.parse(row.commit_stats) : null,
+    ...(row.hackalem_total !== undefined ? { hackalemTotal: row.hackalem_total } : {}),
+    ...(row.quick_total !== undefined ? { quickTotal: row.quick_total } : {}),
+    ...(row.readme_checklist !== undefined
+      ? { readmeChecklist: row.readme_checklist ? JSON.parse(row.readme_checklist) : null }
+      : {}),
     syncedAt: row.synced_at,
     ...(row.analysis_id
       ? {

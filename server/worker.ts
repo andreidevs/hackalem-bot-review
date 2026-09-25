@@ -15,6 +15,7 @@ import { syncOrganization, snapshotProject, PauseError } from "./github.js";
 import { analyzeProject } from "./analysis.js";
 import { answerChat } from "./chat.js";
 import { quickScan } from "./quick.js";
+import { pickTrackTops } from "./catalog.js";
 const lock = join(dataDir, "worker.pid");
 function processStart(pid: number) {
   try {
@@ -76,7 +77,7 @@ async function lane() {
     // Claim is atomic: better-sqlite3 is synchronous, no await between SELECT and UPDATE.
     const raw = db
       .prepare(
-        `SELECT * FROM jobs WHERE state='queued' AND (project_id IS NULL OR (NOT EXISTS(SELECT 1 FROM jobs r WHERE r.state='running' AND r.project_id=jobs.project_id) AND EXISTS(SELECT 1 FROM projects p WHERE p.id=jobs.project_id AND ${activeSql()}))) AND (type IN ('sync','chat','quick') OR (type IN ('snapshot','analyze') AND json_extract(payload,'$.mode')='full')) ORDER BY coalesce(json_extract(payload,'$.priority'),CASE type WHEN 'sync' THEN -30 WHEN 'chat' THEN -20 WHEN 'quick' THEN -15 WHEN 'snapshot' THEN 0 ELSE 10 END),id LIMIT 1`,
+        `SELECT * FROM jobs WHERE state='queued' AND (project_id IS NULL OR (NOT EXISTS(SELECT 1 FROM jobs r WHERE r.state='running' AND r.project_id=jobs.project_id) AND EXISTS(SELECT 1 FROM projects p WHERE p.id=jobs.project_id AND ${activeSql()}))) AND (type IN ('sync','chat','quick','final') OR (type IN ('snapshot','analyze') AND json_extract(payload,'$.mode')='full')) ORDER BY coalesce(json_extract(payload,'$.priority'),CASE type WHEN 'sync' THEN -30 WHEN 'chat' THEN -20 WHEN 'quick' THEN -15 WHEN 'final' THEN -10 WHEN 'snapshot' THEN 0 ELSE 10 END),id LIMIT 1`,
       )
       .get();
     if (!raw) {
@@ -116,6 +117,8 @@ async function lane() {
           continue;
         }
       }
+      else if (job.type === "final")
+        result = await pickTrackTops(job.id, controller.signal);
       else
         result = await answerChat(
           String(job.payload.question),

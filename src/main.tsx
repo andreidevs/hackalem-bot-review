@@ -13,6 +13,7 @@ import {
   BookOpen,
   Layers,
   BarChart3,
+  Copy,
   MessageSquare,
   Settings2,
   RefreshCw,
@@ -47,7 +48,7 @@ import type {
   Evidence,
   SourceFile,
 } from "../shared/types";
-import { STATUS, VERDICTS, COMMON_RUBRIC } from "../shared/types";
+import { STATUS, VERDICTS, COMMON_RUBRIC, HACKALEM_RUBRIC, HACKALEM_MAX, README_CHECKLIST, type ReadmeChecklist } from "../shared/types";
 import "./style.css";
 const fmt = (n: number) => new Intl.NumberFormat("ru-RU").format(n);
 const date = (s: string) =>
@@ -646,7 +647,30 @@ function Catalog({
     "/projects?" + query,
     `${revision}:${stats?.total}:${stats?.snapshots}:${stats?.analyzed}:${stats?.quickReviewed}`,
   );
+  const [copied, setCopied] = useState("");
+  // Copies the repository links of every project under the current filters, not only this page.
+  async function copyLinks() {
+    try {
+      const next = new URLSearchParams(params);
+      next.delete("page");
+      const res = await fetch("/api/projects/links?" + next);
+      if (!res.ok) throw new Error(`Ошибка ${res.status}`);
+      const text = await res.text();
+      await navigator.clipboard.writeText(text);
+      setCopied(`Скопировано ссылок: ${text ? text.split("\n").length : 0}`);
+    } catch (e) {
+      setCopied(`Не удалось скопировать: ${(e as Error).message}`);
+    }
+  }
   const track = tracks.find((t) => t.id === Number(params.get("track")));
+  const sort = (params.get("sort") || "name") as "name" | "score" | "hackalem" | "quick";
+  // The score column shows the value the list is sorted by.
+  const shown = (p: Project): [number | null | undefined, number] =>
+    sort === "hackalem"
+      ? [p.hackalemTotal, HACKALEM_MAX]
+      : sort === "quick"
+        ? [p.quickTotal, 100]
+        : [p.stale ? null : (p.total ?? p.commonTotal), 100];
   const coverage = stats?.total
     ? Math.round((stats.analyzed / stats.total) * 100)
     : 0;
@@ -788,6 +812,24 @@ function Catalog({
           value={params.get("technology") || ""}
           onChange={(e) => change("technology", e.target.value)}
         />
+        <select
+          aria-label="Сортировка"
+          value={sort}
+          onChange={(e) => change("sort", e.target.value === "name" ? "" : e.target.value)}
+        >
+          <option value="name">По названию</option>
+          <option value="score">По оценке кода</option>
+          <option value="hackalem">По шкале HackAlem</option>
+          <option value="quick">По оценке README</option>
+        </select>
+        <button
+          className="button"
+          title="Скопировать ссылки на репозитории всех проектов с текущими фильтрами (например, выбранного трека)"
+          onClick={copyLinks}
+        >
+          <Copy size={15} /> Копировать ссылки
+        </button>
+        {copied && <span role="status" className="muted">{copied}</span>}
       </div>
       <ErrorBox message={error} />
       {!data ? (
@@ -825,7 +867,16 @@ function Catalog({
                 <th>ТРЕК</th>
                 <th>ТЕХНОЛОГИИ</th>
                 <th>СТАТУС</th>
-                <th className="score-col">ОЦЕНКА</th>
+                <th className="score-col">
+                  <button
+                    className="sort-header"
+                    title="Сортировать по оценке кода"
+                    onClick={() => change("sort", sort === "score" ? "" : "score")}
+                  >
+                    {sort === "hackalem" ? "HACKALEM" : sort === "quick" ? "README" : "ОЦЕНКА"}
+                    {sort !== "name" ? " ↓" : ""}
+                  </button>
+                </th>
                 <th />
               </tr>
             </thead>
@@ -888,10 +939,10 @@ function Catalog({
                     <Badge status={p.status} />
                   </td>
                   <td className="score-col">
-                    {p.total != null && !p.stale ? (
+                    {shown(p)[0] != null ? (
                       <span className="score">
-                        {p.total}
-                        <small>/100</small>
+                        {shown(p)[0]}
+                        <small>/{shown(p)[1]}</small>
                       </span>
                     ) : (
                       <span className="muted">—</span>
@@ -998,7 +1049,7 @@ function QuickRankingPage({tracks,stats,params,revision}:{tracks:Track[];stats:S
     <div className="filters"><ActivityFilter stats={stats} /><input aria-label="Поиск в быстром рейтинге" placeholder="Команда или идея…" value={params.get("q") || ""} onChange={e=>change("q",e.target.value)}/><select aria-label="Трек быстрого рейтинга" value={params.get("track") || ""} onChange={e=>change("track",e.target.value)}><option value="">Все 12 треков</option>{tracks.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><Link to="/rankings" className="text-link">Рейтинг по исходному коду <ArrowRight size={14}/></Link></div>
     <div className="quick-actions"><button className="button" disabled={!data?.items.length} onClick={()=>setChosen(data!.items.slice(0,10).map(r=>r.projectId))}>Выбрать первые 10 на странице</button><button className="text-button" onClick={()=>setChosen([])}>Сбросить</button><button className="button primary" disabled={!chosen.length || busy} onClick={()=>run(true)}><Code2 size={15}/>Проверить код выбранных ({chosen.length})</button></div>
     {notice && <div role="status" className="notice">{notice}</div>}<ErrorBox message={error}/>
-    {!data ? <Loading/> : !data.items.length ? <Empty title="Здесь появится отбор по README" detail="Запустите быстрый анализ. Результаты и треки будут появляться по мере обработки пакетов." icon={FileText}/> : <div className="quick-list">{data.items.map(r=><article className="quick-row" key={r.id}><input type="checkbox" aria-label={`Проверить код ${r.team}`} checked={chosen.includes(r.projectId)} disabled={chosen.length>=50 && !chosen.includes(r.projectId)} onChange={()=>setChosen(a=>a.includes(r.projectId)?a.filter(id=>id!==r.projectId):[...a,r.projectId])}/><span className="rank">{r.rank}</span><div><Link to={`/project/${r.projectId}?tab=quick`}><h3>{r.team}</h3></Link><p>{r.summary}</p><span className="badge">{tracks.find(t=>t.id===r.trackId)?.name || "Требует классификации"}</span>{r.trackMismatch && <span className="badge amber" title="В README назван другой кейс; трек стоит проверить">В README: {tracks.find(t=>t.id===r.declaredTrackId)?.name}</span>}{!r.trackId && r.candidates.length>0 && <small> Возможные треки: {r.candidates.map(id=>tracks.find(t=>t.id===id)?.name).join(", ")}</small>}<p className="muted">{r.risks[0]}</p><Link className="text-link" to={`/readme/${r.sourceId}`}>README · {r.sha.slice(0,8)} <ArrowUpRight size={13}/></Link></div><div className="ranking-score">{r.total}<small>/100 · описание</small></div></article>)}</div>}
+    {!data ? <Loading/> : !data.items.length ? <Empty title="Здесь появится отбор по README" detail="Запустите быстрый анализ. Результаты и треки будут появляться по мере обработки пакетов." icon={FileText}/> : <div className="quick-list">{data.items.map(r=><article className="quick-row" key={r.id}><input type="checkbox" aria-label={`Проверить код ${r.team}`} checked={chosen.includes(r.projectId)} disabled={chosen.length>=50 && !chosen.includes(r.projectId)} onChange={()=>setChosen(a=>a.includes(r.projectId)?a.filter(id=>id!==r.projectId):[...a,r.projectId])}/><span className="rank">{r.rank}</span><div><Link to={`/project/${r.projectId}?tab=quick`}><h3>{r.team}</h3></Link><p>{r.summary}</p><span className="badge">{tracks.find(t=>t.id===r.trackId)?.name || "Требует классификации"}</span> <ChecklistBadge checklist={r.readmeChecklist}/>{r.trackMismatch && <span className="badge amber" title="В README назван другой кейс; трек стоит проверить">В README: {tracks.find(t=>t.id===r.declaredTrackId)?.name}</span>}{!r.trackId && r.candidates.length>0 && <small> Возможные треки: {r.candidates.map(id=>tracks.find(t=>t.id===id)?.name).join(", ")}</small>}<p className="muted">{r.risks[0]}</p><Link className="text-link" to={`/readme/${r.sourceId}`}>README · {r.sha.slice(0,8)} <ArrowUpRight size={13}/></Link></div><div className="ranking-score">{r.total}<small>/100 · описание</small></div></article>)}</div>}
     {data && data.total>40 && <div className="pagination"><button className="button" disabled={data.page<=1} onClick={()=>change("page",String(data.page-1))}>Назад</button><span>{data.page} / {Math.ceil(data.total/40)}</span><button className="button" disabled={data.page*40>=data.total} onClick={()=>change("page",String(data.page+1))}>Далее</button></div>}
   </>;
 }
@@ -1029,7 +1080,7 @@ type Detail = {
     | null;
   analysis: Analysis | null;
   quickReview: QuickReview | null;
-  readmeSource: {id:number;path:string|null;text:string;sha:string;status:string} | null;
+  readmeSource: {id:number;path:string|null;text:string;sha:string;status:string;checklist:ReadmeChecklist|null} | null;
   history: {
     id: number;
     total: number;
@@ -1124,6 +1175,7 @@ function ProjectPage({
         ))}
         <Badge status={a?.stale ? "stale" : p.status} />
         <CommitFlags stats={p.commitStats} />
+        <ChecklistBadge checklist={data.readmeSource?.checklist} />
         <span>
           <GitBranch size={14} />
           {p.branch} · {p.sha?.slice(0, 8) || "Нет снимка"}
@@ -1348,6 +1400,7 @@ function ProjectPage({
           {tab === "readme" &&
             (s?.readme || data.readmeSource?.text ? (
               <>
+                <ReadmeChecklistPanel checklist={data.readmeSource?.checklist} />
                 <div className="source-caption">
                   <FileText size={15} />
                   {s?.readmePath || data.readmeSource?.path}
@@ -1551,6 +1604,31 @@ function Assessment({
           <li key={i}>{q}</li>
         ))}
       </ul>
+      {a.hackalemScores && (
+        <details open>
+          <summary>
+            Шкала HackAlem (критерии жюри, п. 5.7.2 Положения) · {a.hackalemTotal}/{HACKALEM_MAX}
+          </summary>
+          <p className="muted">
+            «Презентация, демо и ответы на вопросы» (20 баллов) оценивается только на Demo Day,
+            поэтому здесь максимум {HACKALEM_MAX}.
+          </p>
+          {a.hackalemScores.map((s) => (
+            <div className="finding" key={s.id}>
+              <h3>
+                {HACKALEM_RUBRIC.find((c) => c.id === s.id)?.title || s.id}:{" "}
+                {s.points}/{HACKALEM_RUBRIC.find((c) => c.id === s.id)?.max}
+              </h3>
+              <p>{s.rationale}</p>
+              <EvidenceLinks
+                items={s.evidence}
+                projectId={projectId}
+                snapshotId={a.snapshotId}
+              />
+            </div>
+          ))}
+        </details>
+      )}
       <details>
         <summary>Общая аналитическая шкала · {a.commonTotal}/100</summary>
         {a.commonScores.map((s) => (
@@ -1625,6 +1703,45 @@ function SourceViewer({
     </div>
   );
 }
+// README sections required for the technical check (п. 5.4.15); a keyword check, not a verdict.
+function ChecklistBadge({ checklist }: { checklist?: ReadmeChecklist | null }) {
+  if (!checklist) return null;
+  const total = README_CHECKLIST.length;
+  const missing = checklist.missing
+    .map((id) => README_CHECKLIST.find((c) => c.id === id)?.title || id)
+    .join(", ");
+  return (
+    <span
+      className={`badge ${checklist.passed === total ? "green" : "amber"}`}
+      title={
+        checklist.passed === total
+          ? "README содержит все разделы п. 5.4.15 (по ключевым словам)"
+          : `Нет в README (п. 5.4.15): ${missing}`
+      }
+    >
+      README {checklist.passed}/{total}
+    </span>
+  );
+}
+function ReadmeChecklistPanel({ checklist }: { checklist?: ReadmeChecklist | null }) {
+  if (!checklist) return null;
+  return (
+    <div className="notice">
+      <strong>README по п. 5.4.15 Положения: {checklist.passed}/{README_CHECKLIST.length}</strong>
+      <ul className="checklist">
+        {README_CHECKLIST.map((c) => (
+          <li key={c.id} className={checklist.missing.includes(c.id) ? "missing" : "present"}>
+            {checklist.missing.includes(c.id) ? "✗" : "✓"} {c.title}
+          </li>
+        ))}
+      </ul>
+      <small className="muted">
+        Проверка по ключевым словам: показывает, есть ли раздел, но не его качество. Если проект не
+        запускается по README, команда не допускается к отбору (п. 5.4.16).
+      </small>
+    </div>
+  );
+}
 // Commit rhythm flags: signals for the expert to check, not points. Hours are 13–18 Astana.
 function CommitFlags({ stats }: { stats: Project["commitStats"] }) {
   if (!stats) return null;
@@ -1639,7 +1756,7 @@ function CommitFlags({ stats }: { stats: Project["commitStats"] }) {
         {stats.window} коммитов · {active}/5 ч
       </span>
       {stats.before > 0 && (
-        <span className="badge amber" title="Коммиты команды раньше 13:00 23.09: код мог быть написан до старта">
+        <span className="badge amber" title="Коммиты команды раньше 13:00 23.09. П. 5.4.5 Положения запрещает представлять продукт, готовый до начала соревновательной части; заготовки и свои библиотеки допустимы (п. 5.4.4.2) — проверьте, что именно было до старта">
           До старта: {stats.before}
         </span>
       )}
@@ -1657,7 +1774,7 @@ function CommitFlags({ stats }: { stats: Project["commitStats"] }) {
   );
 }
 type Ranked = Project & { score: number; rank: number };
-function RankingRow({ p, tracks }: { p: Ranked; tracks: Track[] }) {
+function RankingRow({ p, tracks, max = 100 }: { p: Ranked; tracks: Track[]; max?: number }) {
   return (
     <Link to={`/project/${p.id}`} className="ranking-row">
       <span className="rank">{String(p.rank).padStart(2, "0")}</span>
@@ -1667,11 +1784,12 @@ function RankingRow({ p, tracks }: { p: Ranked; tracks: Track[] }) {
         <small>
           {tracks.find((t) => t.id === p.trackId)?.name || "Трек не определён"}
         </small>{" "}
+        <ChecklistBadge checklist={p.readmeChecklist} />{" "}
         <CommitFlags stats={p.commitStats} />
       </div>
       <span className="ranking-score">
         {p.score}
-        <small>/100</small>
+        <small>/{max}</small>
       </span>
       <ArrowUpRight size={18} />
     </Link>
@@ -1683,9 +1801,22 @@ function TopView({ tracks, revision }: { tracks: Track[]; revision: unknown }) {
   const [tick, setTick] = useState(0);
   const { data, error } = useApi<{
     overall: Ranked[];
-    byTrack: { trackId: number; name: string; items: Ranked[] }[];
+    byTrack: {
+      trackId: number;
+      name: string;
+      items: Ranked[];
+      ai?: { stale: boolean; model: string; createdAt: string; items: (Ranked & { reason: string })[] };
+    }[];
     shortlist: { total: number; analyzed: number; maxParts: number };
   }>("/top", `${revision}:${tick}`);
+  async function pick() {
+    try {
+      const r = await api<{ queued: boolean }>("/top/pick", {});
+      setNotice(r.queued ? "AI сравнивает финалистов каждого трека; топы появятся по мере готовности." : "AI-выбор топа уже в очереди.");
+    } catch (e) {
+      setNotice((e as Error).message);
+    }
+  }
   async function start() {
     if (
       !confirm(
@@ -1710,6 +1841,13 @@ function TopView({ tracks, revision }: { tracks: Track[]; revision: unknown }) {
         <button className="button primary" onClick={start}>
           <Play size={15} /> Собрать шорт-лист и проверить код
         </button>
+        <button
+          className="button"
+          title="Модель сравнивает до 10 лучших по баллам проектов трека между собой и выбирает топ-3"
+          onClick={pick}
+        >
+          <BarChart3 size={15} /> AI-выбор топа по трекам
+        </button>
         {!!s?.total && (
           <span className="muted">
             Код проверен: {s.analyzed} из {s.total} (до {s.maxParts} частей кода на проект)
@@ -1733,10 +1871,26 @@ function TopView({ tracks, revision }: { tracks: Track[]; revision: unknown }) {
             ))}
           </div>
           <h2>Топ-3 по трекам</h2>
+          <p className="muted">AI-выбор сравнивает финалистов трека между собой; без него показан порядок по баллам.</p>
           {data.byTrack.map((t) => (
             <section key={t.trackId}>
               <h3>{t.name}</h3>
-              {t.items.length ? (
+              {t.ai?.items.length ? (
+                <>
+                  <p className="muted">
+                    AI-выбор из финалистов · {t.ai.model} · {date(t.ai.createdAt)}
+                    {t.ai.stale && " · финалисты изменились, запустите выбор снова"}
+                  </p>
+                  <div className="ranking-list">
+                    {t.ai.items.map((p) => (
+                      <div key={p.id}>
+                        <RankingRow p={p} tracks={tracks} />
+                        <p className="muted">{p.reason}</p>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : t.items.length ? (
                 <div className="ranking-list">
                   {t.items.map((p) => (
                     <RankingRow key={p.id} p={p} tracks={tracks} />
@@ -1762,8 +1916,13 @@ function Rankings({
   revision: unknown;
 }) {
   const track = params.get("track") || "";
+  const hackalem = track === "hackalem";
   const { data, error } = useApi<(Project & { score: number; rank: number })[]>(
-    track === "top" ? null : "/rankings" + (track ? `?track=${track}` : ""),
+    track === "top"
+      ? null
+      : hackalem
+        ? "/rankings?scale=hackalem"
+        : "/rankings" + (track ? `?track=${track}` : ""),
     revision,
   );
   return (
@@ -1773,9 +1932,11 @@ function Rankings({
         <div>
           <h1>Рейтинги проектов</h1>
           <p>
-            {track
-              ? "Оценки по требованиям выбранного кейса."
-              : "Общий аналитический рейтинг по единой шкале 25/25/25/15/10."}
+            {hackalem
+              ? "Критерии жюри Demo Day из Положения (п. 5.7.2): ценность 25, результат 20, инновационность 15, потенциал 20. Презентация оценивается только на Demo Day."
+              : track && track !== "top"
+                ? "Оценки по требованиям выбранного кейса."
+                : "Общий аналитический рейтинг по единой шкале 25/25/25/15/10."}
           </p>
         </div>
         <div className="button-group">
@@ -1809,6 +1970,7 @@ function Rankings({
           }
         >
           <option value="top">Топ-50 и топ-3 по трекам</option>
+          <option value="hackalem">Шкала HackAlem (критерии жюри, из 80)</option>
           <option value="">Общий аналитический рейтинг</option>
           {tracks.map((t) => (
             <option value={t.id} key={t.id}>
@@ -1834,7 +1996,7 @@ function Rankings({
       ) : (
         <div className="ranking-list">
           {data.map((p) => (
-            <RankingRow key={p.id} p={p} tracks={tracks} />
+            <RankingRow key={p.id} p={p} tracks={tracks} max={hackalem ? HACKALEM_MAX : 100} />
           ))}
         </div>
       )}
@@ -2573,6 +2735,7 @@ function Settings({
                           analyze: "AI-анализ",
                           quick: "Быстрый README + треки",
                           chat: "Вопрос ассистенту",
+                          final: "AI-выбор топа по трекам",
                         }[j.type]
                       }
                     </strong>

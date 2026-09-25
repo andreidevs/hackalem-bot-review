@@ -1,5 +1,6 @@
-import { db, project, latestAnalysis, getProject, getSnapshot, activeSql, setting } from "./db.js";
-import { rankProjects } from "./analysis.js";
+import { db, project, latestAnalysis, getProject, getSnapshot, activeSql, setting, setSetting, progress } from "./db.js";
+import { z } from "zod";
+import { rankProjects, structured } from "./analysis.js";
 import { tracks } from "./tracks.js";
 import type { Project } from "../shared/types.js";
 export function ftsQuery(q: string) {
@@ -16,6 +17,7 @@ export function listProjects(
     status?: string;
     page?: number;
     limit?: number;
+    sort?: "name" | "score" | "hackalem" | "quick";
   } = {},
 ) {
   const conditions: string[] = [activeSql()],
@@ -59,23 +61,36 @@ export function listProjects(
   ).n;
   const limit = Math.min(params.limit || 40, 100),
     page = Math.max(params.page || 1, 1);
+  // Score sorts put projects without a current score last, then fall back to the team name.
+  const hackalem = "(CASE WHEN a.stale=0 THEN json_extract(a.data,'$.hackalemTotal') END)";
+  const quick = "(SELECT q.total FROM quick_reviews q WHERE q.project_id=p.id AND q.stale=0 ORDER BY q.id DESC LIMIT 1)";
+  const score = {
+    name: null,
+    score: "(CASE WHEN a.stale=0 THEN coalesce(a.total,a.common_total) END)",
+    hackalem,
+    quick,
+  }[params.sort || "name"];
+  const order = score ? `${score} IS NULL,${score} DESC,` : "";
   const rows = db
     .prepare(
-      `SELECT p.*,a.id AS analysis_id,a.total,a.common_total,a.stale ${from} ${where} ORDER BY p.team COLLATE NOCASE,p.id LIMIT ? OFFSET ?`,
+      `SELECT p.*,a.id AS analysis_id,a.total,a.common_total,a.stale,${hackalem} AS hackalem_total,${quick} AS quick_total ${from} ${where} ORDER BY ${order}p.team COLLATE NOCASE,p.id LIMIT ? OFFSET ?`,
     )
     .all(...args, limit, (page - 1) * limit);
   return { items: rows.map(project), total, page, limit };
 }
-export function rankings(track?: number) {
+// scale "hackalem" ranks by the jury scale of the regulations (max 80, presentation excluded).
+export function rankings(track?: number, scale: "track" | "hackalem" = "track") {
+  const hackalem = scale === "hackalem";
+  const score = hackalem ? "json_extract(a.data,'$.hackalemTotal')" : track ? "a.total" : "a.common_total";
   const rows = db
     .prepare(
-      `SELECT p.*,a.id AS analysis_id,a.total,a.common_total,a.stale FROM projects p JOIN analyses a ON a.id=(SELECT id FROM analyses WHERE project_id=p.id ORDER BY id DESC LIMIT 1) WHERE a.stale=0 AND ${activeSql()} AND p.status IN ('analyzed','unclassified') ${track ? "AND coalesce(p.manual_track_id,p.track_id)=? AND a.total IS NOT NULL" : ""} ORDER BY ${track ? "a.total" : "a.common_total"} DESC,p.team COLLATE NOCASE`,
+      `SELECT p.*,a.id AS analysis_id,a.total,a.common_total,a.stale,${score} AS score,(SELECT checklist FROM readme_sources WHERE project_id=p.id ORDER BY id DESC LIMIT 1) AS readme_checklist FROM projects p JOIN analyses a ON a.id=(SELECT id FROM analyses WHERE project_id=p.id ORDER BY id DESC LIMIT 1) WHERE a.stale=0 AND ${activeSql()} AND p.status IN ('analyzed','unclassified') ${track ? "AND coalesce(p.manual_track_id,p.track_id)=?" : ""} AND ${score} IS NOT NULL ORDER BY score DESC,p.team COLLATE NOCASE`,
     )
     .all(...(track ? [track] : []));
   return rankProjects(
     rows.map((r: any) => ({
       ...project(r),
-      score: track ? r.total : r.common_total,
+      score: r.score,
     })),
   );
 }
@@ -85,11 +100,85 @@ export function topProjects(overall = 50, perTrack = 3) {
   const done = shortlist.length
     ? (db.prepare(`SELECT count(*) n FROM analyses a WHERE a.stale=0 AND a.project_id IN (${shortlist.map(Number).join(",")})`).get() as { n: number }).n
     : 0;
+  const picks = setting<Record<number, TrackPick>>("trackPicks", {});
   return {
     overall: rankings().slice(0, overall),
-    byTrack: tracks.map((t) => ({ trackId: t.id, name: t.name, items: rankings(t.id).slice(0, perTrack) })),
+    byTrack: tracks.map((t) => {
+      const ranked = rankings(t.id);
+      const pick = picks[t.id];
+      return {
+        trackId: t.id,
+        name: t.name,
+        items: ranked.slice(0, perTrack),
+        // Picked projects whose analysis went stale since are dropped, not shown with old points.
+        ai: pick && {
+          stale: pick.key !== finalistKey(ranked.slice(0, FINALISTS)),
+          model: pick.model,
+          createdAt: pick.createdAt,
+          items: pick.picks.flatMap((x, i) => {
+            const p = ranked.find((r) => r.id === x.projectId);
+            return p ? [{ ...p, rank: i + 1, reason: x.reason }] : [];
+          }),
+        },
+      };
+    }),
     shortlist: { total: shortlist.length, analyzed: done, maxParts: setting("maxParts", 8) },
   };
+}
+// AI pick of each track's top-3. Points come from separate per-project calls and are not
+// calibrated against each other, so the model sees the track's finalists side by side.
+// ponytail: only the top-10 by points compete; a project 11th by points is not reconsidered.
+const FINALISTS = 10;
+type TrackPick = { key: string; picks: { projectId: number; reason: string }[]; model: string; createdAt: string };
+// The pick is current while the same analyses make up the finalists.
+const finalistKey = (items: Project[]) => items.map((p) => p.analysisId).join(",");
+const pickSchema = z.object({
+  top: z.array(z.object({ projectId: z.number().int(), reason: z.string().min(1).max(600) })).min(1).max(3),
+});
+export async function pickTrackTops(jobId: number, signal: AbortSignal) {
+  const saved = setting<Record<number, TrackPick>>("trackPicks", {});
+  let picked = 0;
+  for (const t of tracks) {
+    const items = rankings(t.id).slice(0, FINALISTS);
+    const key = finalistKey(items);
+    if (items.length < 2 || saved[t.id]?.key === key) continue;
+    progress(jobId, `AI-выбор топа: ${t.name}`);
+    const finalists = items.map((p) => {
+      const a = latestAnalysis(p.id)!;
+      const verdicts: Record<string, number> = {};
+      for (const f of a.findings) verdicts[f.verdict] = (verdicts[f.verdict] || 0) + 1;
+      return {
+        projectId: p.id,
+        team: p.team,
+        trackPoints: a.total,
+        hackalemPoints: a.hackalemTotal,
+        summary: a.summary,
+        strengths: a.strengths,
+        weaknesses: a.weaknesses,
+        scores: (a.scores.length ? a.scores : a.commonScores).map((s) => ({ id: s.id, points: s.points, rationale: s.rationale })),
+        requirementVerdicts: verdicts,
+        commitsBeforeStart: p.commitStats?.before ?? null,
+        coverage: a.coverage,
+      };
+    });
+    const ids = new Set(items.map((p) => p.id));
+    const { value, model } = await structured(
+      `Выбери до трёх лучших проектов трека «${t.name}» среди финалистов. Сравнивай проекты между собой: баллы получены в разных вызовах и могут быть несопоставимы, поэтому не копируй порядок по баллам без проверки. Главное — требования ТЗ, подтверждённые кодом (requirementVerdicts.code), затем качество реализации, ценность и оригинальность. Заявленное только в README весит меньше подтверждённого кодом. Коммиты до старта (commitsBeforeStart) — сигнал для эксперта, а не причина исключения. Порядок в top — места 1..3, projectId только из финалистов, без повторов. reason до 300 символов: чем проект сильнее следующих.\nФормат: {"top":[{"projectId":0,"reason":"..."}]}\nТЗ: ${JSON.stringify({ name: t.name, caseName: t.caseName, requirements: t.requirements })}\nsourceData=${JSON.stringify(finalists)}`,
+      pickSchema,
+      signal,
+      (v: z.infer<typeof pickSchema>) => {
+        const seen = new Set<number>();
+        for (const x of v.top) {
+          if (!ids.has(x.projectId) || seen.has(x.projectId)) throw new Error(`projectId ${x.projectId} не из финалистов или повторяется`);
+          seen.add(x.projectId);
+        }
+      },
+    );
+    saved[t.id] = { key, picks: (value as z.infer<typeof pickSchema>).top, model: model || "", createdAt: new Date().toISOString() };
+    setSetting("trackPicks", saved);
+    picked++;
+  }
+  return { tracks: picked };
 }
 // Shortlist for code analysis: best quick scores per track, then the overall best, then large
 // repositories whose README is only the template (the quick screen cannot judge those).

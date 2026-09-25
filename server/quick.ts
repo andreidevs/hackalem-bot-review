@@ -5,7 +5,7 @@ import { github, PauseError } from "./github.js";
 import { configuredCodexModel, jsonAnswer, oneShot } from "./harness.js";
 import { validateScores, rankProjects, SYSTEM } from "./analysis.js";
 import { tracks } from "./tracks.js";
-import { QUICK_RUBRIC, type QuickReview, type SourceFile } from "../shared/types.js";
+import { QUICK_RUBRIC, README_CHECKLIST, type QuickReview, type ReadmeChecklist, type SourceFile } from "../shared/types.js";
 
 export const QUICK_VERSION = "readme-screening-v2";
 export const QUICK_CHARS = 15000;
@@ -50,6 +50,32 @@ db.prepare("UPDATE quick_reviews SET stale=1 WHERE json_extract(data,'$.specHash
 export function isTemplateReadme(text: string) {
   return text.split("\n").filter(l => !/^\s*#/.test(l) && !/Hackathon team repository for/i.test(l)).join("").trim().length < 40;
 }
+// Keyword check of the README sections required by п. 5.4.15. No model call: it is a flag for the
+// expert, and a keyword can only show that a section is present, not that it is correct.
+const CHECKLIST_RULES: Record<string, RegExp> = {
+  architecture: /архитектур|architecture|```mermaid|схема (системы|решения|работы)|data ?flow|компоненты системы/i,
+  technologies: /технологи|стек|\bstack\b|tech(nologies)?\b|built with|используем\S* (библиотек|инструмент|модел)/i,
+  install: /установк|\binstall|pip install|npm (ci|i|install)\b|pnpm install|yarn install|poetry install|uv sync|docker compose build|git clone/i,
+  run: /запуск|запусти|\brun\b|\bstart\b|uvicorn|streamlit run|python3? \S+\.py|npm (run|start)|docker compose up|make run/i,
+  dependencies: /зависимост|dependenc|requirements\S*\.txt|package\.json|pyproject|prerequisit|требовани\S* к (систем|окружени)|python 3\.\d|node(\.js)? \d/i,
+  env: /\.env|переменн\S* окружени|environment variable|env var|_API_KEY|_TOKEN\b|конфигурац\S* окружени/i,
+  verification: /провер\S* (работ|сценари|решени)|как проверить|сценари\S* проверк|демо-сценари|smoke|тест\S* сценари|how to (test|verify|use)|usage|пример\S* (использовани|запрос)|curl /i,
+};
+// Bump when the rules change: stored checklists of another version are recomputed at startup.
+const CHECKLIST_V = 2;
+const storedChecklist = (text: string) => JSON.stringify({ ...readmeChecklist(text), v: CHECKLIST_V });
+const TOOL_NAMES = /\b(python|fastapi|flask|django|streamlit|gradio|react|next\.js|vue|svelte|typescript|javascript|node\.js|express|nestjs|go|rust|java|kotlin|docker|postgres(ql)?|sqlite|mysql|redis|mongodb|pandas|numpy|scikit-learn|pytorch|torch|tensorflow|lightgbm|xgboost|catboost|openai|langchain|llama|whisper|transformers|tailwind|vite|telegram|aiogram)\b/gi;
+export function readmeChecklist(text: string): ReadmeChecklist {
+  const prose = text.split("\n").filter(l => l.trim() && !/^\s*(#|```|\||!\[)/.test(l)).join(" ");
+  const has: Record<string, boolean> = { description: !isTemplateReadme(text) && prose.length >= 200 };
+  for (const [id, re] of Object.entries(CHECKLIST_RULES)) has[id] = re.test(text);
+  // A plain list of tools counts as the technologies section; so does a "check/demo/usage" heading.
+  const tools = new Set((text.match(TOOL_NAMES) || []).map(t => t.toLowerCase()));
+  if (tools.size >= 3) has.technologies = true;
+  if (/^#{1,4}\s.*(провер|тестирован|демо|demo|usage|использовани|сценари)/im.test(text)) has.verification = true;
+  const missing = README_CHECKLIST.map(c => c.id).filter(id => !has[id]);
+  return { passed: README_CHECKLIST.length - missing.length, missing };
+}
 const readmeStatus = (text: string) => !text.trim() ? "missing" : isTemplateReadme(text) ? "template" : "ready";
 // One ranking must come from one model: the key is harness + requested model.
 export function quickModelKey() {
@@ -70,14 +96,16 @@ db.transaction(() => {
   // Reviews made on the old 6000-character excerpt of a longer README are redone on the larger one.
   db.prepare("UPDATE quick_reviews SET stale=1 WHERE stale=0 AND json_extract(data,'$.truncated')=1 AND json_extract(data,'$.reviewedChars')<?").run(QUICK_CHARS * 0.8);
   markOtherModelsStale();
-})();
+  const unchecked = db.prepare("SELECT id,text FROM readme_sources WHERE checklist IS NULL OR coalesce(json_extract(checklist,'$.v'),0)!=?").all(CHECKLIST_V) as {id:number;text:string}[];
+  for (const s of unchecked) db.prepare("UPDATE readme_sources SET checklist=? WHERE id=?").run(storedChecklist(s.text), s.id);
+}).immediate(); // see db.ts: startup migrations run in both processes at once.
 type ReadmeSource = { id: number; project_id: number; sha: string; path: string | null; text: string; status: string; revision: string; created_at: string };
 const sourceByProject = (id: number) => db.prepare("SELECT * FROM readme_sources WHERE project_id=? ORDER BY id DESC LIMIT 1").get(id) as ReadmeSource | undefined;
 
 function saveSource(id: number, sha: string, path: string | null, text: string, status: string) {
   const p = getProject(id)!;
-  const sid = Number(db.prepare("INSERT INTO readme_sources(project_id,sha,path,text,status,revision,created_at) VALUES(?,?,?,?,?,?,?)")
-    .run(id, sha, path, text, status, p.updatedAt, now()).lastInsertRowid);
+  const sid = Number(db.prepare("INSERT INTO readme_sources(project_id,sha,path,text,status,revision,created_at,checklist) VALUES(?,?,?,?,?,?,?,?)")
+    .run(id, sha, path, text, status, p.updatedAt, now(), storedChecklist(text)).lastInsertRowid);
   db.prepare("UPDATE quick_reviews SET stale=1 WHERE project_id=?").run(id);
   indexProject(id);
   return db.prepare("SELECT * FROM readme_sources WHERE id=?").get(sid) as ReadmeSource;
@@ -204,10 +232,10 @@ sourceData=${JSON.stringify(sources.map(s => {
 
 function parseReview(row: any): QuickReview {
   const data = JSON.parse(row.data);
-  return {...data,id:row.id,projectId:row.project_id,sourceId:row.source_id,team:row.team,sha:row.sha,path:row.path,createdAt:row.created_at,
+  return {...data,readmeChecklist:row.checklist ? JSON.parse(row.checklist) : null,id:row.id,projectId:row.project_id,sourceId:row.source_id,team:row.team,sha:row.sha,path:row.path,createdAt:row.created_at,
     stale:!!row.stale || data.methodVersion!==QUICK_VERSION || data.specHash!==specHash || row.revision!==row.project_revision || data.manualTrackId!==row.manual_track_id || !!row.newer_source};
 }
-const REVIEW_SELECT = `SELECT q.*,p.team,p.updated_at project_revision,p.manual_track_id,s.sha,s.path,s.revision,
+const REVIEW_SELECT = `SELECT q.*,p.team,p.updated_at project_revision,p.manual_track_id,s.sha,s.path,s.revision,s.checklist,
   EXISTS(SELECT 1 FROM readme_sources newer WHERE newer.project_id=p.id AND newer.id>s.id) newer_source
   FROM quick_reviews q JOIN projects p ON p.id=q.project_id JOIN readme_sources s ON s.id=q.source_id`;
 export function latestQuickReview(id: number) {

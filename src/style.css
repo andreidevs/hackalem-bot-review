@@ -1944,3 +1944,26 @@ details summary {
     align-items: flex-start;
   }
 }
+.checklist {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+  columns: 2;
+}
+.checklist li.missing {
+  color: #9a7d39;
+}
+@media (max-width: 720px) {
+  .checklist {
+    columns: 1;
+  }
+}
+.sort-header {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  cursor: pointer;
+}

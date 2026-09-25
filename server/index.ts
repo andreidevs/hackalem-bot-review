@@ -168,18 +168,28 @@ app.get("/api/specifications/:hash", (req, res) => {
     ? res.json(JSON.parse(row.data))
     : res.status(404).json({ error: "Версия ТЗ не найдена" });
 });
+const projectQuery = z.object({
+  q: z.string().max(200).optional(),
+  track: z.coerce.number().int().min(0).max(12).optional(),
+  technology: z.string().max(60).optional(),
+  status: z.string().max(30).optional(),
+  page: z.coerce.number().int().min(1).max(100000).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  sort: z.enum(["name", "score", "hackalem", "quick"]).optional(),
+});
 app.get("/api/projects", (req, res) => {
-  const q = z
-    .object({
-      q: z.string().max(200).optional(),
-      track: z.coerce.number().int().min(0).max(12).optional(),
-      technology: z.string().max(60).optional(),
-      status: z.string().max(30).optional(),
-      page: z.coerce.number().int().min(1).max(100000).optional(),
-      limit: z.coerce.number().int().min(1).max(100).optional(),
-    })
-    .parse(req.query);
-  res.json(listProjects(q));
+  res.json(listProjects(projectQuery.parse(req.query)));
+});
+// Repository links of every project matching the catalog filters, one per line.
+app.get("/api/projects/links", (req, res) => {
+  const q = projectQuery.parse(req.query);
+  const urls: string[] = [];
+  for (let page = 1; ; page++) {
+    const r = listProjects({ ...q, page, limit: 100 });
+    urls.push(...r.items.map((p) => p.url));
+    if (page * 100 >= r.total) break;
+  }
+  res.type("text/plain").send(urls.join("\n"));
 });
 app.get("/api/projects/:id", (req, res) => {
   const id = idParam(req.params.id);
@@ -191,7 +201,10 @@ app.get("/api/projects/:id", (req, res) => {
     snapshot: s ? { ...s, files: s.files.map(({ text, ...f }) => f) } : null,
     analysis: latestAnalysis(id),
     quickReview: latestQuickReview(id),
-    readmeSource: db.prepare("SELECT id,path,text,sha,status,created_at FROM readme_sources WHERE project_id=? ORDER BY id DESC LIMIT 1").get(id) || null,
+    readmeSource: (() => {
+      const r = db.prepare("SELECT id,path,text,sha,status,created_at,checklist FROM readme_sources WHERE project_id=? ORDER BY id DESC LIMIT 1").get(id) as any;
+      return r ? { ...r, checklist: r.checklist ? JSON.parse(r.checklist) : null } : null;
+    })(),
     history: db
       .prepare(
         "SELECT id,total,common_total AS commonTotal,created_at AS createdAt,stale,snapshot_id AS snapshotId FROM analyses WHERE project_id=? ORDER BY id DESC",
@@ -258,7 +271,12 @@ app.post("/api/comparisons", (req, res) =>
   res.json(comparison(idsSchema.parse(req.body.ids))),
 );
 app.get("/api/rankings", (req, res) =>
-  res.json(rankings(req.query.track ? idParam(req.query.track) : undefined)),
+  res.json(
+    rankings(
+      req.query.track ? idParam(req.query.track) : undefined,
+      req.query.scale === "hackalem" ? "hackalem" : "track",
+    ),
+  ),
 );
 app.get("/api/rankings/export", (req, res) => {
   const format = z.enum(["csv", "md"]).parse(req.query.format);
@@ -384,6 +402,12 @@ app.post("/api/jobs/:id/cancel", (req, res) => {
   res.json({ ok: true });
 });
 app.get("/api/top", (_req, res) => res.json(topProjects()));
+// AI pick of the top-3 in every track among finished code analyses; unchanged tracks are skipped.
+app.post("/api/top/pick", (_req, res) => {
+  setSetting("paused", false);
+  setSetting("pauseReason", "");
+  res.status(202).json({ queued: enqueue("final") !== null });
+});
 // Code analysis of every active project in one track, so the track ranking covers all of it.
 app.post("/api/tracks/:id/analyze", (req, res) => {
   const trackId = idParam(req.params.id);

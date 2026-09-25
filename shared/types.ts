@@ -66,6 +66,9 @@ export interface Analysis {
   findings: Finding[];
   scores: Score[];
   commonScores: Score[];
+  // HackAlem Demo Day jury scale (Положение, п. 5.7.2) without the presentation criterion.
+  hackalemScores?: Score[];
+  hackalemTotal?: number;
   total: number | null;
   commonTotal: number;
   model: string;
@@ -100,6 +103,10 @@ export interface Project {
   pushedAt: string;
   // Default-branch commits: before 13:00, per hour 13–18 (Astana), after 18:00.
   commitStats: { before: number; window: number; after: number; hours: number[] } | null;
+  readmeChecklist?: ReadmeChecklist | null;
+  // Present in catalog lists: jury-scale score (of 80) and latest quick README score.
+  hackalemTotal?: number | null;
+  quickTotal?: number | null;
   syncedAt: string;
   total?: number | null;
   commonTotal?: number | null;
@@ -125,7 +132,7 @@ export interface Snapshot {
 }
 export interface Job {
   id: number;
-  type: "sync" | "snapshot" | "analyze" | "chat" | "quick";
+  type: "sync" | "snapshot" | "analyze" | "chat" | "quick" | "final";
   projectId: number | null;
   state: "queued" | "running" | "done" | "failed" | "cancelled";
   payload: Record<string, unknown>;
@@ -147,6 +154,7 @@ export interface HarnessInfo {
 }
 export interface QuickReview {
   id: number;
+  readmeChecklist?: ReadmeChecklist | null;
   // Case named in the README itself, and whether the model chose a different one.
   declaredTrackId?: number | null;
   trackMismatch?: boolean;
@@ -197,6 +205,27 @@ export const STATUS: Record<string, string> = {
   stale: "Оценка устарела",
 };
 
+// Jury criteria of the HackAlem regulations (п. 5.7.2). "Презентация, демо и ответы" (20) happens
+// on Demo Day and cannot be judged from the repository, so the static maximum is 80.
+export const HACKALEM_RUBRIC: Criterion[] = [
+  { id: "value", title: "Ценность решения", max: 25 },
+  { id: "result", title: "Результат и качество решения", max: 20 },
+  { id: "innovation", title: "Инновационность", max: 15 },
+  { id: "potential", title: "Потенциал развития и масштабирования", max: 20 },
+];
+export const HACKALEM_MAX = 80;
+// Mandatory README contents for the technical check (Положение, п. 5.4.15 / 5.6.4).
+export const README_CHECKLIST: { id: string; title: string }[] = [
+  { id: "description", title: "Описание решения и назначения" },
+  { id: "architecture", title: "Архитектура" },
+  { id: "technologies", title: "Используемые технологии" },
+  { id: "install", title: "Инструкции по установке" },
+  { id: "run", title: "Инструкции по запуску" },
+  { id: "dependencies", title: "Необходимые зависимости" },
+  { id: "env", title: "Параметры окружения" },
+  { id: "verification", title: "Порядок проверки основного сценария" },
+];
+export type ReadmeChecklist = { passed: number; missing: string[] };
 export const COMMON_RUBRIC: Criterion[] = [
   { id: "fit", title: "Соответствие задаче", max: 25 },
   { id: "technical", title: "Техническая реализация", max: 25 },

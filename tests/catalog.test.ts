@@ -28,6 +28,7 @@ const {
 const { sourceChunks, validateEvidence, validateScores, rankProjects } =
   await import("../server/analysis.js");
 const { tracks, commonRubric } = await import("../server/tracks.js");
+const { HACKALEM_RUBRIC } = await import("../shared/types.js");
 const { listProjects, csvCell, rankings } = await import(
   "../server/catalog.js"
 );
@@ -407,6 +408,12 @@ describe("analysis lifecycle", () => {
       })),
       scores: [],
       commonScores: scores,
+      hackalemScores: HACKALEM_RUBRIC.map((c) => ({
+        id: c.id,
+        points: 2,
+        rationale: "Оценка по коду",
+        evidence: [proof],
+      })),
     };
     setSetting("model", "test-model");
     const replies = [
@@ -428,6 +435,8 @@ describe("analysis lifecycle", () => {
       const controller = new AbortController();
       const result = await analyzeProject(0, 2, controller.signal);
       expect(result.commonTotal).toBe(5);
+      expect((db.prepare("SELECT json_extract(data,'$.hackalemTotal') t FROM analyses ORDER BY id DESC LIMIT 1").get() as any).t).toBe(8);
+      expect(rankings(undefined, "hackalem").find((r) => r.id === 2)?.score).toBe(8);
       expect(mock).toHaveBeenCalledTimes(3);
       expect(getProject(2)?.status).toBe("analyzed");
       const { restoreAnalysisState } = await import("../server/db.js");
@@ -931,4 +940,81 @@ it("queues code analysis for every unanalyzed project of a track", async () => {
     .get() as { n: number };
   expect(queued.n).toBe(body.added);
   expect(setting("maxParts", 8)).toBe(2);
+});
+
+it("checks README sections required by the regulations by keywords", async () => {
+  const { readmeChecklist } = await import("../server/quick.js");
+  const full = `# Сервис
+${"Сервис помогает аналитику выбрать кампании и распределить бюджет по сегментам абонентов. ".repeat(4)}
+## Архитектура
+Бэкенд на FastAPI. Стек: Python, pandas.
+## Установка
+pip install -r requirements.txt
+## Запуск
+cp .env.example .env
+uvicorn app:main
+## Как проверить
+Откройте страницу и загрузите пример.`;
+  expect(readmeChecklist(full)).toEqual({ passed: 8, missing: [] });
+  const bare = readmeChecklist("# hack-1-x\nHackathon team repository for X\n");
+  expect(bare.passed).toBe(0);
+  expect(bare.missing).toContain("run");
+});
+
+it("sorts the catalog by a score with unscored projects last", () => {
+  const t = new Date().toISOString();
+  const ids = (db.prepare("SELECT id FROM projects ORDER BY id LIMIT 3").all() as { id: number }[]).map((r) => r.id);
+  db.prepare("UPDATE quick_reviews SET stale=1").run();
+  ids.slice(0, 2).forEach((id, i) => {
+    const sid = Number(db.prepare("INSERT INTO readme_sources(project_id,sha,path,text,status,revision,created_at) VALUES(?,?,?,?,?,?,?)").run(id, "a".repeat(40), "README.md", "x", "ready", t, t).lastInsertRowid);
+    db.prepare("INSERT INTO quick_reviews(project_id,source_id,track_id,total,data,created_at) VALUES(?,?,?,?,?,?)").run(id, sid, null, 40 + i * 30, "{}", t);
+  });
+  const items = listProjects({ sort: "quick", limit: 100 }).items;
+  expect(items.slice(0, 2).map((p) => p.quickTotal)).toEqual([70, 40]);
+  expect(items.slice(2).every((p) => p.quickTotal == null)).toBe(true);
+});
+
+it("AI picks the track top among finalists and skips an unchanged track", async () => {
+  const harness = await import("../server/harness.js");
+  const { pickTrackTops, topProjects } = await import("../server/catalog.js");
+  const t = tracks[0].id;
+  const src = db.prepare("SELECT snapshot_id,data FROM analyses ORDER BY id DESC LIMIT 1").get() as { snapshot_id: number; data: string };
+  const ids = (db.prepare("SELECT id FROM projects ORDER BY id LIMIT 3").all() as { id: number }[]).map((r) => r.id);
+  db.prepare("UPDATE analyses SET stale=1").run();
+  ids.forEach((id, i) => {
+    db.prepare("INSERT INTO analyses(project_id,snapshot_id,track_id,total,common_total,data,created_at) VALUES(?,?,?,?,?,?,?)")
+      .run(id, src.snapshot_id, t, 50 + i, 50, src.data, new Date().toISOString());
+    db.prepare("UPDATE projects SET manual_track_id=?,status='analyzed' WHERE id=?").run(t, id);
+  });
+  setSetting("trackPicks", {});
+  // The first answer names a project outside the finalists and must be retried.
+  const replies = [
+    { top: [{ projectId: 999999, reason: "Выдуман" }] },
+    { top: [{ projectId: ids[0], reason: "Больше требований подтверждено кодом" }] },
+  ];
+  const mock = vi.spyOn(harness, "oneShot").mockImplementation(async () => ({
+    text: JSON.stringify(replies.shift()),
+    model: "test-model",
+    harness: "codex",
+  }));
+  try {
+    expect(await pickTrackTops(0, new AbortController().signal)).toEqual({ tracks: 1 });
+    expect(mock).toHaveBeenCalledTimes(2);
+    const top = topProjects().byTrack.find((x) => x.trackId === t)!;
+    expect(top.items[0].id).toBe(ids[2]);
+    expect(top.ai?.items.map((p) => [p.id, p.rank])).toEqual([[ids[0], 1]]);
+    expect(top.ai?.stale).toBe(false);
+    expect(await pickTrackTops(0, new AbortController().signal)).toEqual({ tracks: 0 });
+  } finally {
+    mock.mockRestore();
+  }
+});
+
+it("exports repository links of every project in a track", async () => {
+  const t = tracks[0].id;
+  const expected = listProjects({ track: t, limit: 100 }).items.map((p) => p.url);
+  expect(expected.length).toBeGreaterThan(0);
+  const res = await fetch(`${base}/api/projects/links?track=${t}`);
+  expect(res.status).toBe(200);
+  expect((await res.text()).split("\n")).toEqual(expected);
 });
