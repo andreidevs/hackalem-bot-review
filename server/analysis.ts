@@ -23,7 +23,9 @@ const evidenceSchema = z.object({
   path: z.string(),
   start: z.number().int().positive(),
   end: z.number().int().positive(),
-  quote: z.string().min(1).max(1500),
+  // Models often quote a whole block despite the 150-character hint. Its start is still an exact
+  // quote of the same lines, so a long quote is cut instead of failing the whole answer.
+  quote: z.string().min(1).transform((q) => q.slice(0, 1500)),
 });
 const scoreSchema = z.object({
   id: z.string(),
@@ -216,7 +218,7 @@ export async function structured(
       prompt:
         prompt +
         (attempt
-          ? `\nПредыдущий ответ не прошёл проверку структуры: ${last}. Исправь JSON.`
+          ? `\nПредыдущий ответ не прошёл проверку структуры: ${last}. Исправь JSON: экранируй кавычки (\\") и переводы строк (\\n) внутри строк, цитаты до 150 символов.`
           : ""),
       signal,
     });

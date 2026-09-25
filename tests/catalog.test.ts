@@ -1018,3 +1018,18 @@ it("exports repository links of every project in a track", async () => {
   expect(res.status).toBe(200);
   expect((await res.text()).split("\n")).toEqual(expected);
 });
+
+it("repairs unescaped quotes and line breaks inside model strings", () => {
+  const broken = '{"quote":"print("hi")","list":["a "b" c"],"text":"line1\nline2","n":1}';
+  expect(jsonAnswer(broken)).toEqual({ quote: 'print("hi")', list: ['a "b" c'], text: "line1\nline2", n: 1 });
+  expect(() => jsonAnswer('{"a":1 "b":2}')).toThrow();
+});
+
+it("cuts an over-long quote instead of rejecting the answer", async () => {
+  const { analysisSchema } = await import("../server/analysis.js");
+  const long = "x".repeat(2000);
+  const value = analysisSchema.shape.findings.parse([
+    { requirementId: "r", verdict: "code", explanation: "", evidence: [{ path: "a", start: 1, end: 1, quote: long }] },
+  ]);
+  expect(value[0].evidence[0].quote).toBe(long.slice(0, 1500));
+});

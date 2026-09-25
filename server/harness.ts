@@ -379,13 +379,40 @@ export async function oneShot(options: {
     rmSync(cwd, { recursive: true, force: true });
   }
 }
+// Models quoting code sometimes leave a double quote or a line break unescaped inside a string.
+// When the parser stops right after a string, the quote that closed it early is escaped; a raw
+// control character is escaped in place. The schema check still guards the repaired value.
+// ponytail: blind to intent; a genuinely missing comma gets "repaired" into a string and then
+// fails the schema, which retries the call as before.
+function parseRepaired(text: string): unknown {
+  let s = text,
+    first: unknown;
+  for (let n = 0; n <= 50; n++) {
+    try {
+      return JSON.parse(s);
+    } catch (error) {
+      first ??= error;
+      const message = (error as Error).message;
+      const control = /Bad control character in string literal in JSON at position (\d+)/.exec(message);
+      const early = /Expected ',' or '[}\]]' after (?:property value|array element) in JSON at position (\d+)/.exec(message);
+      if (control) {
+        const i = Number(control[1]);
+        s = s.slice(0, i) + JSON.stringify(s[i]).slice(1, -1) + s.slice(i + 1);
+      } else if (early && s.lastIndexOf('"', Number(early[1]) - 1) > 0) {
+        const i = s.lastIndexOf('"', Number(early[1]) - 1);
+        s = s.slice(0, i) + "\\" + s.slice(i);
+      } else break;
+    }
+  }
+  throw first;
+}
 export function jsonAnswer(text: string): unknown {
   const stripped = text
     .trim()
     .replace(/^```(?:json)?\s*/, "")
     .replace(/\s*```$/, "");
   try {
-    return JSON.parse(stripped);
+    return parseRepaired(stripped);
   } catch (error) {
     // Models sometimes add prose before or after the JSON: take the first complete object.
     const start = stripped.indexOf("{");
@@ -399,7 +426,7 @@ export function jsonAnswer(text: string): unknown {
         else if (c === '"') inString = false;
       } else if (c === '"') inString = true;
       else if (c === "{") depth++;
-      else if (c === "}" && --depth === 0) return JSON.parse(stripped.slice(start, i + 1));
+      else if (c === "}" && --depth === 0) return parseRepaired(stripped.slice(start, i + 1));
     }
     throw error;
   }

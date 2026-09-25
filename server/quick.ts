@@ -147,7 +147,7 @@ function excerpt(source: ReadmeSource): SourceFile {
     text = text.slice(0, text.lastIndexOf("\n"));
   return { path: source.path!, text, lines: text.split("\n").length, bytes: Buffer.byteLength(text) };
 }
-const evidence = z.object({ path: z.string(), start: z.number().int().positive(), end: z.number().int().positive(), quote: z.string().min(1).max(600) });
+const evidence = z.object({ path: z.string(), start: z.number().int().positive(), end: z.number().int().positive(), quote: z.string().min(1).transform(q => q.slice(0, 600)) });
 // Presentation limits are trimmed, not rejected: an overlong list must not discard a whole batch.
 // Scores, evidence and IDs stay strict.
 const text = (max: number) => z.string().transform((v) => v.slice(0, max));

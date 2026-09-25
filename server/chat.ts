@@ -76,7 +76,7 @@ export async function answerChat(
             path: z.string(),
             start: z.number().int().positive(),
             end: z.number().int().positive(),
-            quote: z.string().min(1).max(1500),
+            quote: z.string().min(1).transform((q) => q.slice(0, 1500)),
           }),
         )
         .min(1)
