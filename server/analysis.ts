@@ -69,24 +69,32 @@ function relocate(text: string, pattern: RegExp, claimed: number) {
   }
   return best;
 }
+// Models often join separate lines of the cited range with "\n", skipping the lines between.
+// If every joined line is verbatim in the range, in order, the quote becomes the exact source
+// span from the first to the last of them.
+function unstitch(lines: string[], e: Evidence) {
+  const parts = e.quote.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (parts.length < 2) return null;
+  let at = e.start - 1,
+    first = -1;
+  for (const part of parts) {
+    while (at < e.end && !lines[at].includes(part)) at++;
+    if (at >= e.end) return null;
+    if (first < 0) first = at;
+    at++;
+  }
+  return { start: first + 1, end: at, quote: lines.slice(first, at).join("\n") };
+}
 export function validateEvidence(evidence: Evidence[], files: SourceFile[]) {
   const byPath = new Map(files.map((f) => [f.path, f]));
   for (const e of evidence) {
     const f = byPath.get(e.path);
-    if (
-      !f ||
-      !Number.isInteger(e.start) ||
-      !Number.isInteger(e.end) ||
-      e.start < 1 ||
-      e.end < e.start ||
-      e.end > f.lines ||
-      !e.quote.trim()
-    )
+    if (!f || !e.quote.trim())
       throw new Error(`Неверная ссылка на источник: ${e.path}:${e.start}`);
-    const fragment = f.text
-      .split("\n")
-      .slice(e.start - 1, e.end)
-      .join("\n");
+    // A range outside the file is not fatal: the quote is then looked up in the whole file.
+    const inRange = Number.isInteger(e.start) && Number.isInteger(e.end) && e.start >= 1 && e.end >= e.start && e.end <= f.lines;
+    const lines = f.text.split("\n");
+    const fragment = inRange ? lines.slice(e.start - 1, e.end).join("\n") : "";
     if (!fragment.includes(e.quote)) {
       // A model may collapse line wraps. Restore the exact source spelling;
       // no word, punctuation or case changes are accepted.
@@ -99,8 +107,10 @@ export function validateEvidence(evidence: Evidence[], files: SourceFile[]) {
         .join("[*_`~]*\\s+[*_`~]*");
       const match = pattern ? fragment.match(new RegExp(pattern)) : null;
       const moved = !match && pattern ? relocate(f.text, new RegExp(pattern, "g"), e.start) : null;
+      const stitched = !match && !moved && inRange ? unstitch(lines, e) : null;
       if (match) e.quote = match[0];
       else if (moved) Object.assign(e, moved);
+      else if (stitched) Object.assign(e, stitched);
       else
         throw new Error(
           `Цитата не найдена в ${e.path}:${e.start}. Цитата: ${JSON.stringify(e.quote.slice(0, 200))}. Реальные строки: ${JSON.stringify(fragment.slice(0, 700))}`,
@@ -431,11 +441,12 @@ export async function analyzeProject(
   for (const f of value.findings) {
     if (!track?.requirements.some((r) => r.id === f.requirementId))
       throw new Error("Неизвестное требование в ответе модели");
+    // A verdict without a quote is not proven: it becomes "insufficient data" instead of failing.
     if (
       ["code", "readme", "contradiction"].includes(f.verdict) &&
       !f.evidence.length
     )
-      throw new Error("Вывод без доказательства");
+      f.verdict = "unknown";
     validateEvidence(f.evidence, snapshot.files);
   }
   if (

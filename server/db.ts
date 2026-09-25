@@ -50,14 +50,21 @@ export const now = () => new Date().toISOString();
 // HackAlem AI 2026 development window: 23.09 13:00–18:00 Astana (UTC+5); repos were archived after it.
 export const HACKATHON_START = "2026-09-23T08:00:00Z";
 export const HACKATHON_END = "2026-09-23T13:00:00Z";
+// "Last commit on the hackathon day": 23.09.2026 in Astana time, 00:00–24:00 UTC+5.
+export const HACKATHON_DAY = "2026-09-23";
+export type Activity = number | "hackathon" | typeof HACKATHON_DAY;
 export function activeSql(alias = "p") {
-  const hours = setting<number | "hackathon">("activityHours", 0);
+  const hours = setting<Activity>("activityHours", 0);
+  if (hours === HACKATHON_DAY)
+    return `coalesce(${alias}.pushed_at,${alias}.updated_at) >= '2026-09-22T19:00:00Z' AND coalesce(${alias}.pushed_at,${alias}.updated_at) < '2026-09-23T19:00:00Z'`;
   // Fixed window: a push during or after the start means the team committed during the hackathon.
   if (hours === "hackathon") return `coalesce(${alias}.pushed_at,${alias}.updated_at) >= '${HACKATHON_START}'`;
   if (!hours) return "1";
   const cutoff = new Date(Date.now() - hours * 3600000).toISOString().replace(/\.\d{3}Z$/, "Z");
   return `coalesce(${alias}.pushed_at,${alias}.updated_at) >= '${cutoff}'`;
 }
+// The 24-hour window was removed; a saved one becomes the hackathon-day filter.
+if (setting<Activity>("activityHours", 0) === 24) setSetting("activityHours", HACKATHON_DAY);
 export const isActive = (id: number) =>
   !!db.prepare(`SELECT 1 FROM projects p WHERE p.id=? AND ${activeSql()}`).get(id);
 export function setting<T>(key: string, fallback: T): T {

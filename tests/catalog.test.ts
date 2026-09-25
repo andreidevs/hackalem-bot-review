@@ -208,7 +208,11 @@ describe("retrieval and scoring", () => {
     expect(() =>
       validateEvidence([{ ...proof, path: "secret.py" }], files),
     ).toThrow();
-    expect(() => validateEvidence([{ ...proof, end: 3 }], files)).toThrow();
+    // A verbatim quote with a range past the end of the file gets its real lines back.
+    const past = { ...proof, end: 3 };
+    validateEvidence([past], files);
+    expect([past.start, past.end]).toEqual([2, 2]);
+    expect(() => validateEvidence([{ ...proof, end: 3, quote: "return 100" }], files)).toThrow();
     expect(() =>
       validateEvidence([{ ...proof, quote: "return 100" }], files),
     ).toThrow();
@@ -591,11 +595,11 @@ it("restores exact line wraps without accepting changed wording", () => {
   ).toThrow();
 });
 
-it("rejects empty or zero-line evidence and extracts only declared demo links", async () => {
+it("fixes zero-line evidence, rejects an empty quote and extracts only declared demo links", async () => {
   const files = [{ path: "x", text: "source", lines: 1, bytes: 6 }];
-  expect(() =>
-    validateEvidence([{ path: "x", start: 0, end: 1, quote: "source" }], files),
-  ).toThrow();
+  const zero = { path: "x", start: 0, end: 1, quote: "source" };
+  validateEvidence([zero], files);
+  expect([zero.start, zero.end]).toEqual([1, 1]);
   expect(() =>
     validateEvidence([{ path: "x", start: 1, end: 1, quote: "" }], files),
   ).toThrow();
@@ -836,6 +840,12 @@ it("hides and skips projects without a push inside the activity window", async (
     expect(isActive(2)).toBe(true);
     expect(isActive(3)).toBe(false);
     expect(listProjects().items.map((p) => p.id)).not.toContain(3);
+    // Last commit on 23.09 Astana time: 23:30 on the 22nd (UTC) counts, 19:00 on the 23rd does not.
+    db.prepare("UPDATE projects SET pushed_at='2026-09-22T19:30:00Z' WHERE id=2").run();
+    db.prepare("UPDATE projects SET pushed_at='2026-09-23T19:00:00Z' WHERE id=3").run();
+    setSetting("activityHours", "2026-09-23");
+    expect(isActive(2)).toBe(true);
+    expect(isActive(3)).toBe(false);
     setSetting("activityHours", 0);
     expect(activeSql()).toBe("1");
     expect(isActive(3)).toBe(true);
@@ -1032,4 +1042,16 @@ it("cuts an over-long quote instead of rejecting the answer", async () => {
     { requirementId: "r", verdict: "code", explanation: "", evidence: [{ path: "a", start: 1, end: 1, quote: long }] },
   ]);
   expect(value[0].evidence[0].quote).toBe(long.slice(0, 1500));
+});
+
+it("accepts stitched lines and a range past the end when the text is verbatim", () => {
+  const text = "MAX_PILOT_CUSTOMERS = 200\nMAX_ADAPTIVE_PILOTS = 8\nMAX_PILOTS_PER_CANDIDATE = 2\nMAX_PILOT_CONTACTS = 1_600";
+  const files = [{ path: "a.py", text, bytes: text.length, lines: 4 }];
+  const stitched = { path: "a.py", start: 1, end: 4, quote: "MAX_ADAPTIVE_PILOTS = 8\nMAX_PILOT_CONTACTS = 1_600" };
+  validateEvidence([stitched], files);
+  expect(stitched).toEqual({ path: "a.py", start: 2, end: 4, quote: text.split("\n").slice(1).join("\n") });
+  const past = { path: "a.py", start: 40, end: 40, quote: "MAX_PILOTS_PER_CANDIDATE = 2" };
+  validateEvidence([past], files);
+  expect([past.start, past.end]).toEqual([3, 3]);
+  expect(() => validateEvidence([{ path: "a.py", start: 1, end: 4, quote: "MAX_ADAPTIVE_PILOTS = 8\nINVENTED = 1" }], files)).toThrow("Цитата не найдена");
 });

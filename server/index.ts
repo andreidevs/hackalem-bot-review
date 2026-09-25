@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import {
   db,
   enqueue,
+  HACKATHON_DAY,
   enqueueAllAnalyses,
   requestFullAnalysis,
   getProject,
@@ -450,7 +451,7 @@ app.post("/api/shortlist", (req, res) => {
 });
 // Activity window in hours (0 = all). A fresh sync refreshes pushed_at for every repo.
 app.patch("/api/settings/activity", (req, res) => {
-  const { hours } = z.object({ hours: z.union([z.literal(0), z.literal(24), z.literal(48), z.literal("hackathon")]) }).parse(req.body);
+  const { hours } = z.object({ hours: z.union([z.literal(0), z.literal(48), z.literal("hackathon"), z.literal(HACKATHON_DAY)]) }).parse(req.body);
   setSetting("activityHours", hours);
   // Sliding windows need fresh push dates; the hackathon window is fixed (repos are archived).
   // Sync refreshes push dates for sliding windows and fills commit stats for the hackathon window.

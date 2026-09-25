@@ -221,7 +221,7 @@ function Markdown({ text, base }: { text: string; base?: string }) {
 type Stats = {
   total: number;
   allProjects: number;
-  activityHours: number | "hackathon";
+  activityHours: number | "hackathon" | "2026-09-23";
   quickReviewed: number;
   analysisMode: "quick" | "full";
   snapshots: number;
@@ -464,6 +464,7 @@ function App() {
             />
           ) : path === "/rankings" ? (
             <Rankings
+              stats={stats}
               tracks={tracks || []}
               params={params}
               revision={`${stats?.analyzed}:${stats?.activityHours}`}
@@ -562,7 +563,7 @@ function TrackAnalysis({ track }: { track: Track }) {
 }
 // Global activity window: projects without a recent push are hidden and not processed.
 function ActivityFilter({ stats }: { stats: Stats | null }) {
-  const [value, setValue] = useState<number | "hackathon" | null>(null);
+  const [value, setValue] = useState<Stats["activityHours"] | null>(null);
   const hours = value ?? stats?.activityHours ?? 0;
   const hidden = stats ? stats.allProjects - stats.total : 0;
   return (
@@ -571,7 +572,8 @@ function ActivityFilter({ stats }: { stats: Stats | null }) {
         aria-label="Последний коммит"
         value={hours}
         onChange={async (e) => {
-          const next = e.target.value === "hackathon" ? "hackathon" : Number(e.target.value);
+          const v = e.target.value;
+          const next = (/^\d+$/.test(v) ? Number(v) : v) as Stats["activityHours"];
           setValue(next);
           try {
             await api("/settings/activity", { hours: next }, "PATCH");
@@ -581,8 +583,8 @@ function ActivityFilter({ stats }: { stats: Stats | null }) {
         }}
       >
         <option value={0}>Все проекты</option>
+        <option value="2026-09-23">Последний коммит 23.09.2026</option>
         <option value="hackathon">Коммиты во время хакатона (23.09, 13–18)</option>
-        <option value={24}>Коммит за последние 24 ч</option>
         <option value={48}>Коммит за последние 48 ч</option>
       </select>
       {hours !== 0 && hidden > 0 && (
@@ -1907,10 +1909,12 @@ function TopView({ tracks, revision }: { tracks: Track[]; revision: unknown }) {
   );
 }
 function Rankings({
+  stats,
   tracks,
   params,
   revision,
 }: {
+  stats: Stats | null;
   tracks: Track[];
   params: URLSearchParams;
   revision: unknown;
@@ -1960,6 +1964,7 @@ function Rankings({
         определяет жюри. Неполные и устаревшие оценки исключены.
       </div>
       <div className="filters">
+        <ActivityFilter stats={stats} />
         <select
           aria-label="Рейтинг трека"
           value={track}
